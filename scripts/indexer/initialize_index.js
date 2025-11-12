@@ -1,13 +1,17 @@
 'use strict';
 
 /**
- * NPM Registry Ultra-Fast Indexer - Production Ready
+ * NPM Registry Ultra-Fast Indexer - Change Stream Based
  * Author: Zeeeepa
  * Date: 2025-11-12
  * 
+ * CHANGE STREAM LOGIC:
+ * - Uses "since" parameter (sequence number) for resume
+ * - Checkpoint stores last processed sequence
+ * - 100 parallel workers processing ranges
+ * - Guaranteed CSV output
+ * 
  * PROVEN: 5.4M packages in 15.75 minutes (343K/min)
- * GUARANTEED: CSV output always created
- * INCREMENTAL: Saves progress during fetch
  */
 
 const fs = require('fs');
@@ -19,15 +23,15 @@ const path = require('path');
 
 const CONFIG = {
   registry: 'https://registry.npmmirror.com',
-  workers: 100,                   // 100 workers always
-  changesBatchSize: 50000,        // 50K batches
-  enrichConcurrency: 100,         // 100 concurrent for enrichment
+  workers: 100,
+  changesBatchSize: 50000,
+  enrichConcurrency: 100,
   outputFile: path.join(__dirname, 'npm.csv'),
   checkpointFile: path.join(__dirname, 'npm.checkpoint.json'),
   timeout: 120000,
   requestDelay: 0,
   maxRetries: 2,
-  skipEnrichment: true,           // DEFAULT: Skip enrichment (change to false for full metadata)
+  skipEnrichment: true,
 };
 
 const logger = console;
@@ -38,14 +42,16 @@ const logger = console;
 
 let TOTAL_PACKAGES = new Set();
 let PACKAGE_METADATA = new Map();
+
+// Change stream checkpoint (like the pattern you showed)
 let CHECKPOINT = {
-  lastSequence: 0,
+  since: '0',              // Last processed sequence (string, like in your code)
   totalPackages: 0,
   lastUpdate: null,
 };
 
 // ============================================================================
-// CSV Writer (Incremental)
+// CSV Writer
 // ============================================================================
 
 class IncrementalCSVWriter {
@@ -57,7 +63,6 @@ class IncrementalCSVWriter {
   
   init() {
     this.stream = fs.createWriteStream(this.filepath, { encoding: 'utf8' });
-    // Write header
     this.stream.write('number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n');
     logger.log('[CSV] Initialized: %s', this.filepath);
   }
@@ -87,7 +92,7 @@ class IncrementalCSVWriter {
       
       buffer += row;
       
-      if (buffer.length > 1000000) { // Flush every 1MB
+      if (buffer.length > 1000000) {
         this.stream.write(buffer);
         buffer = '';
       }
@@ -164,7 +169,7 @@ async function fetchWithRetry(url, maxRetries = CONFIG.maxRetries) {
 }
 
 // ============================================================================
-// Checkpoint Management
+// Checkpoint Management (Change Stream Pattern)
 // ============================================================================
 
 function loadCheckpoint() {
@@ -172,8 +177,8 @@ function loadCheckpoint() {
     try {
       const data = JSON.parse(fs.readFileSync(CONFIG.checkpointFile, 'utf8'));
       CHECKPOINT = data;
-      logger.log('[CHECKPOINT] Loaded: seq=%s, packages=%d',
-        CHECKPOINT.lastSequence,
+      logger.log('[CHECKPOINT] Loaded: since=%s, packages=%d',
+        CHECKPOINT.since,
         CHECKPOINT.totalPackages
       );
       return true;
@@ -184,16 +189,63 @@ function loadCheckpoint() {
   return false;
 }
 
-function saveCheckpoint(seq, totalPackages) {
-  CHECKPOINT.lastSequence = seq;
+function saveCheckpoint(since, totalPackages) {
+  CHECKPOINT.since = String(since);  // Store as string like your pattern
   CHECKPOINT.totalPackages = totalPackages;
   CHECKPOINT.lastUpdate = new Date().toISOString();
   
   try {
     fs.writeFileSync(CONFIG.checkpointFile, JSON.stringify(CHECKPOINT, null, 2), 'utf8');
-    logger.log('[CHECKPOINT] Saved: seq=%s, packages=%d', seq, totalPackages);
+    logger.log('[CHECKPOINT] Saved: since=%s, packages=%d', since, totalPackages);
   } catch (err) {
     logger.error('[CHECKPOINT] Save error: %s', err.message);
+  }
+}
+
+// ============================================================================
+// Get Initial Since (like getInitialSince)
+// ============================================================================
+
+async function getInitialSince(registry) {
+  try {
+    const data = await fetchWithRetry(`${registry}/`);
+    const updateSeq = data.update_seq || 0;
+    const since = String(updateSeq - 10); // Start 10 sequences before current
+    logger.log('[INIT] Initial since: %s (update_seq: %s)', since, updateSeq);
+    return since;
+  } catch (err) {
+    logger.error('[INIT] Failed to get initial since: %s', err.message);
+    return '0';
+  }
+}
+
+// ============================================================================
+// Fetch Changes (like fetchChanges generator)
+// ============================================================================
+
+async function* fetchChanges(registry, since, limit = CONFIG.changesBatchSize) {
+  const url = `${registry}/_changes?since=${since}&limit=${limit}&include_docs=false`;
+  
+  try {
+    const data = await fetchWithRetry(url);
+    const results = data.results || [];
+    
+    if (results.length > 0) {
+      for (const change of results) {
+        const seq = String(change.seq);
+        const fullname = change.id;
+        
+        // Skip design docs and ensure seq !== since (like your pattern)
+        if (seq && fullname && seq !== since && !fullname.startsWith('_')) {
+          yield {
+            fullname,
+            seq,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    logger.error('[FETCH] Error at since=%s: %s', since, err.message);
   }
 }
 
@@ -203,40 +255,44 @@ function saveCheckpoint(seq, totalPackages) {
 
 async function fetchSequenceRange(workerId, startSeq, endSeq) {
   const packages = new Set();
-  let since = startSeq;
+  let since = String(startSeq);
   let requestCount = 0;
   let errors = 0;
   const maxErrors = 3;
+  let lastSeq = since;
   
   const totalRange = endSeq - startSeq;
   
-  while (since < endSeq && errors < maxErrors) {
-    const url = `${CONFIG.registry}/_changes?since=${since}&limit=${CONFIG.changesBatchSize}&include_docs=false`;
-    
+  while (parseInt(since) < endSeq && errors < maxErrors) {
     try {
-      const data = await fetchWithRetry(url);
-      const results = data.results || [];
+      let hasResults = false;
       
-      if (results.length === 0) break;
-      
-      for (const change of results) {
-        const id = change.id;
-        if (id && !id.startsWith('_') && !id.startsWith('design/')) {
-          packages.add(id);
-        }
+      // Use generator pattern like your code
+      for await (const change of fetchChanges(CONFIG.registry, since)) {
+        packages.add(change.fullname);
+        lastSeq = change.seq;
+        hasResults = true;
       }
       
-      since = data.last_seq || results[results.length - 1].seq;
+      if (!hasResults) {
+        logger.log('[Worker #%d] No more results at since=%s', workerId, since);
+        break;
+      }
+      
+      since = lastSeq;
       requestCount++;
       errors = 0;
       
       if (requestCount % 5 === 0) {
-        const progress = Math.min((since - startSeq) / totalRange * 100, 100).toFixed(1);
-        logger.log('[Worker #%d] %s%% | seq: %s | pkgs: %d | reqs: %d',
-          workerId, progress, since.toLocaleString(), packages.size, requestCount);
+        const progress = Math.min((parseInt(since) - startSeq) / totalRange * 100, 100).toFixed(1);
+        logger.log('[Worker #%d] %s%% | since: %s | pkgs: %d | reqs: %d',
+          workerId, progress, since, packages.size, requestCount);
       }
       
-      if (since >= endSeq) break;
+      if (parseInt(since) >= endSeq) {
+        logger.log('[Worker #%d] Reached target since=%s', workerId, endSeq);
+        break;
+      }
       
     } catch (err) {
       errors++;
@@ -249,14 +305,14 @@ async function fetchSequenceRange(workerId, startSeq, endSeq) {
     }
   }
   
-  logger.log('[Worker #%d] ✓ DONE: %d packages in %d requests (seq: %s → %s)',
-    workerId, packages.size, requestCount, startSeq.toLocaleString(), since.toLocaleString());
+  logger.log('[Worker #%d] ✓ DONE: %d packages in %d requests (since: %s → %s)',
+    workerId, packages.size, requestCount, startSeq, lastSeq);
   
   return {
     workerId,
     packages: Array.from(packages),
     success: errors < maxErrors,
-    finalSeq: since,
+    finalSeq: lastSeq,
   };
 }
 
@@ -264,14 +320,16 @@ async function fetchSequenceRange(workerId, startSeq, endSeq) {
 // Worker Pool
 // ============================================================================
 
-async function runWorkerPool(startSeq, maxSeq) {
+async function runWorkerPool(startSince, maxSeq) {
   const poolStart = Date.now();
   const workerCount = CONFIG.workers;
+  
+  const startSeq = parseInt(startSince);
   const seqPerWorker = Math.ceil((maxSeq - startSeq) / workerCount);
   
   logger.log('[POOL] ═══════════════════════════════════════════════════');
   logger.log('[POOL] Ultra-Fast: %d workers × 50K batches', workerCount);
-  logger.log('[POOL] Range: %s → %s', startSeq.toLocaleString(), maxSeq.toLocaleString());
+  logger.log('[POOL] Since: %s → %s', startSince, maxSeq);
   logger.log('[POOL] ═══════════════════════════════════════════════════');
   
   const workerPromises = [];
@@ -293,10 +351,10 @@ async function runWorkerPool(startSeq, maxSeq) {
   
   logger.log('[POOL] ═══════════════════════════════════════════════════');
   logger.log('[POOL] Complete in %s minutes', poolDuration);
-  logger.log('[POOL] ═══════════════════════════════════════════════════');
   
   let totalNewPackages = 0;
   let successfulWorkers = 0;
+  let finalSeq = startSince;
   
   for (const result of results) {
     if (result.success) {
@@ -307,6 +365,10 @@ async function runWorkerPool(startSeq, maxSeq) {
         }
       }
       successfulWorkers++;
+      // Track highest sequence processed
+      if (parseInt(result.finalSeq) > parseInt(finalSeq)) {
+        finalSeq = result.finalSeq;
+      }
     }
   }
   
@@ -315,6 +377,7 @@ async function runWorkerPool(startSeq, maxSeq) {
   logger.log('[POOL] New packages: %s', totalNewPackages.toLocaleString());
   logger.log('[POOL] Total unique: %s', TOTAL_PACKAGES.size.toLocaleString());
   logger.log('[POOL] Workers: %d/%d', successfulWorkers, workerPromises.length);
+  logger.log('[POOL] Final since: %s', finalSeq);
   logger.log('[POOL] Throughput: %s pkg/min', throughput.toLocaleString());
   
   return {
@@ -323,11 +386,12 @@ async function runWorkerPool(startSeq, maxSeq) {
     successfulWorkers,
     duration: poolDuration,
     throughput,
+    finalSeq,
   };
 }
 
 // ============================================================================
-// Enrichment (100 workers)
+// Enrichment
 // ============================================================================
 
 async function enrichPackage(packageName) {
@@ -367,7 +431,6 @@ async function enrichAllPackages() {
   logger.log('[ENRICH] ═══════════════════════════════════════════════════');
   logger.log('[ENRICH] Starting: %d packages', total);
   logger.log('[ENRICH] Concurrency: %d workers', CONFIG.enrichConcurrency);
-  logger.log('[ENRICH] Est. time: ~60-90 minutes');
   logger.log('[ENRICH] ═══════════════════════════════════════════════════');
   
   const enrichStart = Date.now();
@@ -403,11 +466,9 @@ async function enrichAllPackages() {
   
   const enrichDuration = ((Date.now() - enrichStart) / 1000 / 60).toFixed(2);
   
-  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
   logger.log('[ENRICH] ✓ Complete in %s minutes', enrichDuration);
   logger.log('[ENRICH]   Enriched: %s', enriched.toLocaleString());
   logger.log('[ENRICH]   Failed: %s', failed.toLocaleString());
-  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
 }
 
 // ============================================================================
@@ -418,13 +479,12 @@ async function main() {
   const startTime = Date.now();
   
   logger.log('═══════════════════════════════════════════════════════════════');
-  logger.log('NPM Registry Ultra-Fast Indexer');
+  logger.log('NPM Registry Ultra-Fast Indexer - Change Stream Pattern');
   logger.log('═══════════════════════════════════════════════════════════════');
   logger.log('Config:');
   logger.log('  Workers: %d', CONFIG.workers);
   logger.log('  Batch: %s', CONFIG.changesBatchSize.toLocaleString());
   logger.log('  Enrichment: %s', CONFIG.skipEnrichment ? 'SKIP (~15 min)' : 'YES (~90 min)');
-  logger.log('  Output: %s', CONFIG.outputFile);
   logger.log('═══════════════════════════════════════════════════════════════');
   
   const csvWriter = new IncrementalCSVWriter(CONFIG.outputFile);
@@ -436,12 +496,21 @@ async function main() {
     const rootData = await fetchWithRetry(`${CONFIG.registry}/`);
     const maxSeq = rootData.update_seq || 0;
     
-    logger.log('[INIT] Registry: %s sequences', maxSeq.toLocaleString());
+    logger.log('[INIT] Registry update_seq: %s', maxSeq.toLocaleString());
     
-    const startSeq = hasCheckpoint ? CHECKPOINT.lastSequence : 0;
+    // Get since from checkpoint or initialize
+    let since;
+    if (hasCheckpoint && CHECKPOINT.since !== '0') {
+      since = CHECKPOINT.since;
+      logger.log('[SYNC] Resuming from since: %s', since);
+    } else {
+      since = await getInitialSince(CONFIG.registry);
+      logger.log('[INIT] Starting from since: %s', since);
+    }
     
-    if (hasCheckpoint && startSeq >= maxSeq) {
-      logger.log('[SYNC] Already up to date!');
+    // Check if already up to date
+    if (parseInt(since) >= maxSeq) {
+      logger.log('[SYNC] Already up to date! (since=%s >= maxSeq=%s)', since, maxSeq);
       process.exit(0);
     }
     
@@ -450,10 +519,10 @@ async function main() {
     logger.log('[STEP 1/3] FETCH (%d workers)', CONFIG.workers);
     logger.log('═══════════════════════════════════════════════════════════════');
     
-    const poolResult = await runWorkerPool(startSeq, maxSeq);
+    const poolResult = await runWorkerPool(since, maxSeq);
     
-    // Save checkpoint immediately after fetch
-    saveCheckpoint(maxSeq, poolResult.totalPackages);
+    // Save checkpoint with final sequence (change stream pattern)
+    saveCheckpoint(poolResult.finalSeq, poolResult.totalPackages);
     
     // STEP 2: Enrichment (optional)
     if (!CONFIG.skipEnrichment) {
@@ -473,7 +542,7 @@ async function main() {
       logger.log('═══════════════════════════════════════════════════════════════');
     }
     
-    // STEP 3: Write CSV (ALWAYS HAPPENS)
+    // STEP 3: Write CSV
     logger.log('═══════════════════════════════════════════════════════════════');
     logger.log('[STEP 3/3] CSV EXPORT');
     logger.log('═══════════════════════════════════════════════════════════════');
@@ -498,32 +567,34 @@ async function main() {
     logger.log('Duration: %s minutes', totalDuration);
     logger.log('Packages: %s', poolResult.totalPackages.toLocaleString());
     logger.log('Throughput: %s pkg/min', throughput.toLocaleString());
+    logger.log('Final since: %s', poolResult.finalSeq);
     logger.log('═══════════════════════════════════════════════════════════════');
     
     // Show sample
     const sample = fs.readFileSync(CONFIG.outputFile, 'utf8').split('\n').slice(0, 6).join('\n');
     logger.log('[SAMPLE]\n%s', sample);
     
-    logger.log('\n💡 To re-run: node initialize_index.js');
-    logger.log('💡 For enrichment: Edit CONFIG.skipEnrichment = false');
+    logger.log('\n💡 Re-run to sync: node initialize_index.js');
+    logger.log('💡 Checkpoint: since=%s', poolResult.finalSeq);
     
     process.exit(0);
     
   } catch (err) {
     logger.error('═══════════════════════════════════════════════════════════════');
     logger.error('✗ FAILED: %s', err.message);
+    logger.error('Stack: %s', err.stack);
     logger.error('═══════════════════════════════════════════════════════════════');
     
-    // Still try to save CSV
+    // Recovery
     try {
       if (TOTAL_PACKAGES.size > 0) {
-        logger.log('[RECOVERY] Attempting to save %d packages...', TOTAL_PACKAGES.size);
+        logger.log('[RECOVERY] Saving %d packages...', TOTAL_PACKAGES.size);
         csvWriter.writePackages(TOTAL_PACKAGES);
         await csvWriter.close();
         logger.log('[RECOVERY] ✓ CSV saved!');
       }
     } catch (csvErr) {
-      logger.error('[RECOVERY] Failed to save CSV: %s', csvErr.message);
+      logger.error('[RECOVERY] Failed: %s', csvErr.message);
     }
     
     process.exit(1);
