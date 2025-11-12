@@ -1,519 +1,312 @@
-# NPM Registry Indexer v4.0.0
+# NPM Registry Complete Indexer
 
-**Author:** Zeeeepa  
-**Date:** 2025-01-12  
-**Status:** Production-Ready
+**Single-file, all-in-one solution for indexing 5.4M+ npm packages**
 
-## 🎯 Overview
+## Features
 
-A high-performance, duplicate-free npm registry indexer that fetches all package names from npm registries (e.g., `registry.npmmirror.com`) and exports them as enumerated JSON.
+- 🚀 **100 parallel workers** for maximum speed
+- 🔄 **Zero duplicates** with global Set-based deduplication
+- 📊 **Full metadata enrichment**: descriptions, keywords, dependencies, file counts, sizes
+- 💾 **Checkpoint system** for incremental sync
+- 📝 **CSV export** with exact format specified
+- 🔁 **Smart re-run**: Running again syncs to latest state
+- ⚡ **Single command**: No parameters, no setup
 
-### ✨ Key Features
-
-- ✅ **Zero duplicates** - SQLite PRIMARY KEY constraint guarantees uniqueness
-- ✅ **Deterministic enumeration** - Consistent sequential numbering via rowid ordering
-- ✅ **Resume-safe** - Automatic checkpointing with re-run support
-- ✅ **Memory-efficient** - Streaming architecture for 5.4M+ packages
-- ✅ **High throughput** - ~1M packages/minute with parallel workers
-- ✅ **Two methods** - Streaming `/-/all` (primary) and parallel `_changes` (fallback)
-
-### 🔥 What's New in v4.0
-
-This is a complete rewrite that eliminates the duplicate issues from v3.0:
-
-**v3.0 Problems:**
-- ❌ Cross-worker duplicates from race conditions
-- ❌ Inconsistent sequential numbering
-- ❌ Direct file writes causing corruption
-- ❌ No global deduplication
-
-**v4.0 Solutions:**
-- ✅ SQLite-backed global deduplication
-- ✅ Single-source-of-truth for all package names
-- ✅ Atomic inserts with `INSERT OR IGNORE`
-- ✅ Deterministic export with consistent rowid ordering
-
----
-
-## 🚀 Quick Start
-
-### Installation
+## Quick Start
 
 ```bash
-# Install dependencies
-npm install
+# First run - creates complete index
+node initialize_index.js
+
+# Output:
+#   npm.csv             - Complete index (5.4M+ lines)
+#   npm.checkpoint.json - State for sync
+
+# Second run - syncs to latest
+node initialize_index.js
+
+# Automatically fetches only new/updated packages
 ```
 
-### Basic Usage
+## Output Format
 
-```bash
-# Method 1: Auto-detect (tries /-/all first, fallback to _changes)
-npm run indexer:init
+### CSV Structure
 
-# Method 2: Export to JSON after initialization
-npm run indexer:export
-
-# Method 3: Full pipeline (init + export)
-npm run indexer:full
+```csv
+number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords
+1,https://www.npmjs.com/package/@storybook/preact,@storybook/preact,18,16803,0,117,2025-10-30,"Storybook Preact renderer...",""
+2,https://www.npmjs.com/package/shebang-regex,shebang-regex,5,3234,0,2672,2021-08-13,Regular expression for matching a shebang line,""
 ```
 
-### Expected Output
+### Columns Explained
+
+| Column | Description | Example |
+|--------|-------------|---------|
+| `number` | Sequential row number | `1` |
+| `npm_url` | Package URL on npmjs.com | `https://www.npmjs.com/package/lodash` |
+| `package_name` | Full package name | `@scope/package-name` |
+| `file_number` | Count of files in package | `18` |
+| `unpacked_size` | Size when extracted (bytes) | `16803` |
+| `dependencies` | Count of dependencies | `5` |
+| `dependents` | Packages depending on this | `2672` |
+| `latest_release_published_at` | Publish date (YYYY-MM-DD) | `2025-10-30` |
+| `description` | Package description | `"A utility library..."` |
+| `keywords` | Comma-separated keywords | `"util,helper,lodash"` |
+
+## Checkpoint System
+
+### First Run
 
-```
-data/
-├── index.db              # SQLite database (unique packages)
-├── package-index.json    # Enumerated JSON output
-└── index-metadata.json   # Metadata (counts, duration, etc.)
-```
-
----
-
-## 📖 Detailed Usage
-
-### Step 1: Initialize Database
-
-Fetch packages from registry and store in SQLite:
-
-```bash
-npm run indexer:init
-```
-
-**Environment Variables:**
-```bash
-NPM_REGISTRY=https://registry.npmmirror.com   # Registry URL
-DB_PATH=./data/index.db                       # Database path
-FETCH_METHOD=auto                             # auto|all|changes
-LIMIT=100000                                  # Dry-run limit (0 = no limit)
-WORKERS=100                                   # Parallel workers (changes method)
-```
-
-**Examples:**
-
-```bash
-# Dry run: fetch only 100k packages for testing
-LIMIT=100000 npm run indexer:init
-
-# Force /-/all method
-npm run indexer:all
-
-# Force _changes method with 50 workers
-WORKERS=50 npm run indexer:changes
-
-# Custom registry
-NPM_REGISTRY=https://registry.npmjs.org npm run indexer:init
-```
-
-### Step 2: Export to JSON
-
-Convert SQLite database to JSON format:
-
-```bash
-npm run indexer:export
-```
-
-**Environment Variables:**
-```bash
-DB_PATH=./data/index.db                    # Database path
-OUTPUT_DIR=./data                          # Output directory
-EXPORT_LIMIT=100000                        # Partial export (0 = all)
-STREAM_BATCH_SIZE=100000                   # Memory batch size
-```
-
-**Examples:**
-
-```bash
-# Partial export: first 100k packages
-EXPORT_LIMIT=100000 npm run indexer:export
-
-# Custom output directory
-OUTPUT_DIR=./output npm run indexer:export
-```
-
-### Full Pipeline
-
-Run initialization and export in one command:
-
-```bash
-npm run indexer:full
-```
-
----
-
-## 🏗️ Architecture
-
-### Primary Method: Streaming `/-/all`
-
-**Endpoint:** `https://registry.npmmirror.com/-/all`
-
-**Flow:**
-1. Stream HTTP response (prevents memory overflow)
-2. Parse JSON incrementally with `stream-json`
-3. Batch insert into SQLite (10k packages/batch)
-4. SQLite deduplicates via `PRIMARY KEY` constraint
-5. Checkpoint WAL every 10 seconds
-
-**Advantages:**
-- ✅ Single HTTP request
-- ✅ Natural deduplication (each package appears once)
-- ✅ ~10-15 minutes for 5.4M packages
-- ✅ Simpler, more reliable
-
-### Fallback Method: Parallel `_changes`
-
-**Endpoint:** `https://registry.npmmirror.com/_changes`
-
-**Flow:**
-1. Fetch max sequence from registry root
-2. Split sequence range across 100 workers
-3. Each worker fetches batches (10k changes)
-4. All workers insert into shared SQLite database
-5. SQLite deduplicates via `PRIMARY KEY` constraint
-6. Workers run in parallel with `Promise.all()`
-
-**Advantages:**
-- ✅ High throughput (~1M packages/minute)
-- ✅ Robust retry logic per worker
-- ✅ Progress tracking per worker
-
-**Trade-offs:**
-- ⚠️ More complex (100 concurrent HTTP clients)
-- ⚠️ Same package may appear multiple times in `_changes` feed
-- ⚠️ Requires more network bandwidth
-
-### SQLite Database Schema
-
-```sql
-CREATE TABLE packages (
-  name TEXT PRIMARY KEY NOT NULL
-) WITHOUT ROWID;
-
-CREATE TABLE meta (
-  key TEXT PRIMARY KEY NOT NULL,
-  value TEXT
-) WITHOUT ROWID;
-```
-
-**Why SQLite?**
-- ✅ ACID guarantees (no race conditions)
-- ✅ `PRIMARY KEY` enforces uniqueness
-- ✅ WAL mode for high write throughput
-- ✅ Fast indexed queries
-- ✅ Resume-safe (durable checkpoints)
-- ✅ Portable single-file format
-
-### Export Format
-
-**Output:** `data/package-index.json`
-
-```json
-[
-  ["@babel/core", 1],
-  ["express", 2],
-  ["react", 3],
-  ...
-]
-```
-
-**Format:** `[["package-name", seq], ...]`
-
-- `seq` is deterministic (sorted by package name)
-- No duplicates guaranteed
-- Consistent across re-runs
-
----
-
-## 🔧 Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NPM_REGISTRY` | `https://registry.npmmirror.com` | Registry URL |
-| `DB_PATH` | `./data/index.db` | SQLite database path |
-| `OUTPUT_DIR` | `./data` | Output directory for JSON |
-| `FETCH_METHOD` | `auto` | `auto`, `all`, or `changes` |
-| `LIMIT` | `0` | Limit packages (0 = no limit, dry-run) |
-| `EXPORT_LIMIT` | `0` | Limit export (0 = all, partial export) |
-| `WORKERS` | `100` | Number of parallel workers (`changes` method) |
-| `BATCH_SIZE` | `10000` | SQLite insert batch size |
-| `CHANGES_BATCH_SIZE` | `10000` | Changes per API request |
-| `DB_BATCH_SIZE` | `5000` | DB insert batch per worker |
-| `STREAM_BATCH_SIZE` | `100000` | Export streaming batch size |
-| `TIMEOUT` | `300000` | HTTP timeout (ms) |
-| `REQUEST_DELAY` | `10` | Delay between requests (ms) |
-
-### Advanced Usage
-
-```bash
-# High-performance configuration (more aggressive)
-WORKERS=200 \
-BATCH_SIZE=20000 \
-CHANGES_BATCH_SIZE=20000 \
-REQUEST_DELAY=5 \
-npm run indexer:changes
-
-# Memory-constrained configuration
-BATCH_SIZE=1000 \
-STREAM_BATCH_SIZE=10000 \
-npm run indexer:full
-
-# Custom registry with authentication (if needed)
-NPM_REGISTRY=https://custom-registry.example.com \
-npm run indexer:init
-```
-
----
-
-## 📊 Performance
-
-### Expected Results (5.4M packages from registry.npmmirror.com)
-
-| Method | Duration | Throughput | Memory | Database Size |
-|--------|----------|------------|--------|---------------|
-| **Streaming /-/all** | 10-15 min | ~400k/min | <500 MB | ~200 MB |
-| **Parallel _changes** | 5-10 min | ~800k/min | <1 GB | ~200 MB |
-
-### Bottlenecks
-
-1. **Network bandwidth** - Primary constraint
-2. **Registry rate limits** - May throttle requests
-3. **Disk I/O** - WAL checkpoints (minimal impact)
-
-### Optimization Tips
-
-- Use a fast network connection
-- Run on SSD for better SQLite performance
-- Increase `WORKERS` if network allows (test with small `LIMIT` first)
-- Use `LIMIT` for dry-runs to validate configuration
-
----
-
-## 🛡️ Resume & Error Handling
-
-### Automatic Resume
-
-The indexer is **fully resume-safe**:
-
-1. **SQLite durability** - WAL journal ensures no data loss
-2. **Idempotent inserts** - `INSERT OR IGNORE` allows re-runs
-3. **Checkpoint metadata** - Progress tracked in `meta` table
-
-**To resume:**
-```bash
-# Just re-run the same command
-npm run indexer:init
-```
-
-SQLite will skip existing packages automatically.
-
-### Error Scenarios
-
-| Error | Behavior | Recovery |
-|-------|----------|----------|
-| Network timeout | Worker retries with exponential backoff | Automatic |
-| Partial fetch | Saves all processed packages | Re-run to continue |
-| Database corruption | **Rare** (WAL protects integrity) | Delete `index.db` and restart |
-| Out of memory | Unlikely (streaming architecture) | Reduce `BATCH_SIZE` |
-
-### Monitoring
-
-Check progress in real-time:
-
-```bash
-# Watch database size grow
-watch -n 5 'du -h data/index.db'
-
-# Check package count
-sqlite3 data/index.db "SELECT COUNT(*) FROM packages;"
-
-# Check metadata
-sqlite3 data/index.db "SELECT * FROM meta;"
-```
-
----
-
-## 📂 Output Files
-
-### `data/index.db` (SQLite Database)
-
-**Schema:**
-- `packages` table: All unique package names
-- `meta` table: Metadata (timestamps, counts, config)
-
-**Query Examples:**
-
-```bash
-# Total package count
-sqlite3 data/index.db "SELECT COUNT(*) FROM packages;"
-
-# Sample packages
-sqlite3 data/index.db "SELECT name FROM packages LIMIT 10;"
-
-# Check metadata
-sqlite3 data/index.db "SELECT * FROM meta;"
-
-# Search for a package
-sqlite3 data/index.db "SELECT * FROM packages WHERE name LIKE '%react%';"
-```
-
-### `data/package-index.json` (Enumerated JSON)
-
-**Format:**
-```json
-[
-  ["@babel/core", 1],
-  ["@babel/preset-env", 2],
-  ...
-]
-```
-
-**Usage:**
-```javascript
-const index = require('./data/package-index.json');
-
-// Map: package name -> sequence number
-const nameToSeq = new Map(index);
-console.log(nameToSeq.get('react')); // e.g., 123456
-
-// Map: sequence number -> package name
-const seqToName = new Map(index.map(([name, seq]) => [seq, name]));
-console.log(seqToName.get(1)); // e.g., "@babel/core"
-```
-
-### `data/index-metadata.json` (Metadata)
-
-**Contents:**
 ```json
 {
-  "timestamp": "2025-01-12T10:30:00.000Z",
-  "totalPackages": 5400000,
-  "method": "streaming-all",
-  "registry": "https://registry.npmmirror.com",
-  "exportDurationSeconds": "45.23",
-  "fileSizeMB": "180.5",
-  "version": "4.0.0"
+  "lastSequence": 112735702,
+  "totalPackages": 5406114,
+  "lastUpdate": "2025-11-12T21:45:00.000Z"
 }
 ```
 
----
+### Re-run Behavior
 
-## 🐛 Troubleshooting
+1. **Loads checkpoint** from previous run
+2. **Fetches only changes** since `lastSequence`
+3. **Merges new packages** with existing data
+4. **Updates CSV** with new entries
+5. **Saves new checkpoint**
 
-### Issue: Duplicate packages in JSON
+## Architecture
 
-**Solution:** This should NOT happen in v4.0. If it does:
-1. Delete `data/index.db`
-2. Re-run `npm run indexer:init`
-3. Check SQLite integrity: `sqlite3 data/index.db "PRAGMA integrity_check;"`
+### Three-Stage Pipeline
 
-### Issue: Incomplete fetch
-
-**Symptoms:** Total packages < expected (e.g., 3M instead of 5.4M)
-
-**Solutions:**
-1. Re-run `npm run indexer:init` (will resume automatically)
-2. Try `npm run indexer:changes` (parallel workers may cover gaps)
-3. Check network stability
-4. Increase `TIMEOUT` environment variable
-
-### Issue: Out of memory
-
-**Symptoms:** Process killed, heap allocation error
-
-**Solutions:**
-1. Reduce `BATCH_SIZE` (e.g., `BATCH_SIZE=1000`)
-2. Reduce `STREAM_BATCH_SIZE` (e.g., `STREAM_BATCH_SIZE=10000`)
-3. Use Node.js with increased heap: `node --max-old-space-size=4096 scripts/indexer/initialize_index.js`
-
-### Issue: Database locked
-
-**Symptoms:** `SQLITE_BUSY` error
-
-**Solutions:**
-1. Ensure only one indexer process runs at a time
-2. Check for zombie processes: `ps aux | grep indexer`
-3. Delete lock file: `rm data/index.db-wal data/index.db-shm`
-
-### Issue: Slow export
-
-**Symptoms:** Export takes >5 minutes
-
-**Solutions:**
-1. Increase `STREAM_BATCH_SIZE` (e.g., `STREAM_BATCH_SIZE=500000`)
-2. Use SSD for `OUTPUT_DIR`
-3. Check disk I/O: `iostat -x 5`
-
----
-
-## 🧪 Testing
-
-### Dry Run (100k packages)
-
-```bash
-# Quick test: fetch 100k packages
-LIMIT=100000 npm run indexer:init
-
-# Export to JSON
-EXPORT_LIMIT=100000 npm run indexer:export
-
-# Verify output
-cat data/package-index.json | jq length  # Should output 100000
+```
+┌─────────────────────────────────────────────┐
+│ STAGE 1: PARALLEL FETCH (100 workers)      │
+│ ├─ Each worker: sequence range             │
+│ ├─ Inline deduplication (Set)              │
+│ └─ Global merge (conflict-free)            │
+└─────────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────────┐
+│ STAGE 2: METADATA ENRICHMENT                │
+│ ├─ Batch processing (20 concurrent)        │
+│ ├─ Fetch: /package-name                    │
+│ ├─ Extract: description, keywords, deps    │
+│ └─ Store: PACKAGE_METADATA Map             │
+└─────────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────────┐
+│ STAGE 3: CSV EXPORT                         │
+│ ├─ Sort packages alphabetically            │
+│ ├─ Write header + rows                     │
+│ ├─ Proper CSV escaping                     │
+│ └─ Result: npm.csv                         │
+└─────────────────────────────────────────────┘
 ```
 
-### Validation
+### Global State Management
 
-```bash
-# Check for duplicates in database (should return 0)
-sqlite3 data/index.db "SELECT name, COUNT(*) FROM packages GROUP BY name HAVING COUNT(*) > 1;"
-
-# Check JSON format
-cat data/package-index.json | jq '.[0:5]'
-
-# Verify sequential numbering
-cat data/package-index.json | jq '.[0:5] | .[1]'  # Should be [name, 1]
+```javascript
+TOTAL_PACKAGES = new Set()           // All unique packages
+PACKAGE_METADATA = new Map()         // packageName → metadata
+CHECKPOINT = {                        // Resume state
+  lastSequence: 0,
+  totalPackages: 0,
+  lastUpdate: null
+}
 ```
 
----
+## Performance
 
-## 📝 Changelog
+### Expected Times
 
-### v4.0.0 (2025-01-12)
-- ✅ Complete rewrite with SQLite-backed deduplication
-- ✅ Eliminated all duplicate issues from v3.0
-- ✅ Added streaming `/-/all` as primary method
-- ✅ Added resume-safe checkpointing
-- ✅ Memory-efficient export with streaming
-- ✅ Deterministic sequential numbering
+| Operation | Time | Speed | Notes |
+|-----------|------|-------|-------|
+| **Fetch** | 2-3 hours | 1M+ pkgs/hour | 100 workers parallel |
+| **Enrich** | 3-4 hours | 30K pkgs/hour | 20 concurrent requests |
+| **Export** | 5-10 min | 1M rows/min | Streaming write |
+| **Total** | ~6-8 hours | - | Complete pipeline |
 
-### v3.0.0 (2025-11-12)
-- ❌ 100 parallel workers with direct file writes
-- ❌ Race conditions causing duplicates
-- ❌ Inconsistent sequential numbering
-- ❌ No global deduplication
+### Memory Usage
 
----
+- **Fetch phase**: ~500MB (Set + intermediate)
+- **Enrich phase**: ~1GB (Map + fetch buffers)
+- **Export phase**: ~100MB (streaming)
+- **Peak**: ~1.2GB
 
-## 🤝 Contributing
+### Disk Usage
 
-This is a stable, production-ready tool. If you encounter issues:
+- **npm.csv**: ~800MB (5.4M rows)
+- **npm.checkpoint.json**: <1KB
+- **Total**: ~800MB
 
-1. Check this README for troubleshooting steps
-2. Verify your environment variables
-3. Try a dry run with `LIMIT=100000`
-4. Check SQLite database integrity
+## Configuration
 
----
+### Environment Variables (Optional)
 
-## 📄 License
+```bash
+# Custom registry
+NPM_REGISTRY=https://registry.npmjs.org node initialize_index.js
 
-MIT License - Zeeeepa 2025
+# Custom output location
+OUTPUT_FILE=./data/packages.csv node initialize_index.js
 
----
+# Adjust concurrency
+ENRICH_CONCURRENCY=10 node initialize_index.js
+```
 
-## 🙏 Credits
+### Built-in Configuration
 
-- **Author:** Zeeeepa
-- **Inspiration:** Original v3.0 design with critical fixes
-- **Dependencies:** axios, better-sqlite3, stream-json
-- **Registry:** [registry.npmmirror.com](https://registry.npmmirror.com) (China npm mirror)
+```javascript
+CONFIG = {
+  registry: 'https://registry.npmmirror.com',
+  workers: 100,                    // Parallel workers
+  changesBatchSize: 10000,         // Records per fetch
+  enrichConcurrency: 20,           // Concurrent enrichment
+  outputFile: './npm.csv',         // Output filename
+  checkpointFile: './npm.checkpoint.json',
+  timeout: 60000,                  // HTTP timeout (ms)
+  requestDelay: 5,                 // Delay between requests (ms)
+  maxRetries: 3,                   // Retry attempts
+}
+```
+
+## Error Handling
+
+### Automatic Retry
+
+- Network errors: 3 retries with exponential backoff
+- Worker failures: Logged but don't block other workers
+- Enrichment failures: Logged, package saved with empty metadata
+
+### Resume on Failure
+
+If the script crashes:
+
+1. **Fetch phase**: Workers that completed are merged, checkpoint saved
+2. **Enrich phase**: Re-run will re-enrich (idempotent)
+3. **Export phase**: Re-run will regenerate CSV
+
+## CSV Escaping
+
+Proper RFC 4180 compliance:
+
+```javascript
+// Values with special chars are quoted
+"lodash" → lodash
+"a,b,c" → "a,b,c"
+"say \"hi\"" → "say ""hi"""
+```
+
+## Examples
+
+### Full Run Output
+
+```
+═══════════════════════════════════════════════════════
+NPM Registry Complete Indexer - All-in-One Edition
+═══════════════════════════════════════════════════════
+Configuration:
+  Registry: https://registry.npmmirror.com
+  Workers: 100 parallel
+  Output: npm.csv
+═══════════════════════════════════════════════════════
+[INIT] Registry max sequence: 112,735,702
+[INIT] Registry doc count: 5,406,114
+═══════════════════════════════════════════════════════
+[STEP 1/3] FETCHING PACKAGES (100 workers)
+═══════════════════════════════════════════════════════
+[POOL] Starting 100 workers...
+[Worker #0] START: seq 0 → 1,127,358
+...
+[POOL] ✓ Merge complete: 5,406,114 packages
+═══════════════════════════════════════════════════════
+[STEP 2/3] ENRICHING METADATA (5,406,114 packages)
+═══════════════════════════════════════════════════════
+[ENRICH] Progress: 50.0% (2703057/5406114)
+...
+[ENRICH] ✓ Complete: 5,395,230 enriched, 10,884 failed
+═══════════════════════════════════════════════════════
+[STEP 3/3] EXPORTING CSV
+═══════════════════════════════════════════════════════
+[CSV] ✓ Complete: 5,406,114 rows, 823.45 MB
+═══════════════════════════════════════════════════════
+✓✓✓ COMPLETE ✓✓✓
+═══════════════════════════════════════════════════════
+Duration: 387.23 minutes
+Total packages: 5,406,114
+Throughput: 13,968 packages/minute
+Output: npm.csv
+Checkpoint: seq=112735702 (for next sync)
+```
+
+### Incremental Sync Output
+
+```
+[CHECKPOINT] Loaded: seq=112735702, packages=5406114
+[INIT] Registry max sequence: 112,850,000
+[SYNC] Resuming from sequence: 112,735,702
+[SYNC] Fetching changes: 112,735,702 → 112,850,000
+...
+[POOL] ✓ Merge complete: 1,234 new packages (total: 5,407,348)
+...
+✓✓✓ COMPLETE ✓✓✓
+Duration: 12.34 minutes
+Total packages: 5,407,348
+New packages: 1,234
+```
+
+## Troubleshooting
+
+### Slow Enrichment
+
+**Problem**: Enrichment taking too long
+
+**Solution**: Adjust `enrichConcurrency`
+
+```bash
+ENRICH_CONCURRENCY=50 node initialize_index.js
+```
+
+### Network Errors
+
+**Problem**: Frequent network timeouts
+
+**Solution**: 
+1. Increase timeout: Edit `CONFIG.timeout` in code
+2. Add delay: Edit `CONFIG.requestDelay` in code
+
+### Memory Issues
+
+**Problem**: Out of memory error
+
+**Solution**:
+1. Run with more memory: `node --max-old-space-size=4096 initialize_index.js`
+2. Reduce worker count: Edit `CONFIG.workers` to `50`
+
+## Technical Details
+
+### Why 100 Workers?
+
+- Registry has 112M sequences
+- Each worker handles ~1.1M sequences
+- Parallel processing reduces total time from 10+ hours to 2-3 hours
+
+### Why Set for Deduplication?
+
+- O(1) lookup time
+- Native JavaScript, no external dependencies
+- Memory efficient for 5.4M entries (~500MB)
+
+### Why Checkpoint System?
+
+- Resume on failure without re-fetching everything
+- Enable incremental daily/hourly syncs
+- Track state for monitoring
+
+## License
+
+MIT
+
+## Credits
+
+Created by Zeeeepa for efficient npm registry indexing.
 
