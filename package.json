@@ -7,7 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "ci": "npm run lint && npm run build"
+    "ci": "npm run lint && npm run build",
+    "indexer:init": "node scripts/indexer/initialize_index.js",
+    "indexer:export": "node scripts/indexer/export_json.js",
+    "indexer:full": "npm run indexer:init && npm run indexer:export",
+    "indexer:all": "FETCH_METHOD=all node scripts/indexer/initialize_index.js",
+    "indexer:changes": "FETCH_METHOD=changes node scripts/indexer/initialize_index.js"
   },
   "dependencies": {
     "@ant-design/cssinjs": "^1.11.1",
@@ -46,7 +51,10 @@
     "eslint": "^8.44.0",
     "eslint-config-next": "^13.4.4",
     "prettier": "^3.0.3",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "axios": "^1.6.0",
+    "better-sqlite3": "^9.2.0",
+    "stream-json": "^1.8.0"
   },
   "overrides": {
     "npm-package-arg": {
