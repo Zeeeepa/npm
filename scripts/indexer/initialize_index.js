@@ -1,41 +1,38 @@
 'use strict';
 
 /**
- * NPM Registry Complete Indexer - All-in-One Edition
+ * NPM Registry Ultra-Fast Indexer - 10 Minute Edition
  * Author: Zeeeepa
  * Date: 2025-11-12
  * 
- * FEATURES:
- * - 100 parallel workers for maximum speed
- * - Fetches from registry.npmmirror.com (Chinese mirror)
- * - Global deduplication using Set
- * - Enrichment: descriptions, keywords, dependencies, file counts, etc.
- * - CSV export with exact format specified
- * - Checkpoint system for incremental sync
- * - Single file, single run: node initialize_index.js
- * - Re-run automatically syncs to latest state
+ * BREAKTHROUGH PERFORMANCE:
+ * - 100 parallel workers processing HUGE batches
+ * - Target: Complete 5.4M packages in ~10 minutes
+ * - Strategy: Fetch ALL package names first (fast), enrich later (optional)
+ * - Smart batch sizing: 50K records per worker fetch
+ * - Aggressive parallelism: No delays, max throughput
  * 
- * OUTPUT: npm.csv (5.4M+ lines with full metadata)
+ * OUTPUT: npm.csv (5.4M+ lines, basic data fast, enrichment optional)
  */
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 // ============================================================================
-// Configuration
+// Ultra-Performance Configuration
 // ============================================================================
 
 const CONFIG = {
   registry: 'https://registry.npmmirror.com',
   workers: 100,
-  changesBatchSize: 10000,
-  enrichConcurrency: 20,
+  changesBatchSize: 50000,        // HUGE batches: 50K per request
+  enrichConcurrency: 100,         // Aggressive concurrency
   outputFile: path.join(__dirname, 'npm.csv'),
   checkpointFile: path.join(__dirname, 'npm.checkpoint.json'),
-  timeout: 60000,
-  requestDelay: 5,
-  maxRetries: 3,
+  timeout: 120000,                // 2 minute timeout
+  requestDelay: 0,                // NO DELAYS - maximum speed
+  maxRetries: 2,                  // Fewer retries for speed
+  skipEnrichment: false,          // Set true to skip enrichment for 10min target
 };
 
 const logger = console;
@@ -45,7 +42,7 @@ const logger = console;
 // ============================================================================
 
 let TOTAL_PACKAGES = new Set();
-let PACKAGE_METADATA = new Map(); // packageName -> { description, keywords, etc. }
+let PACKAGE_METADATA = new Map();
 let CHECKPOINT = {
   lastSequence: 0,
   totalPackages: 0,
@@ -63,7 +60,7 @@ async function fetchWithRetry(url, maxRetries = CONFIG.maxRetries) {
     try {
       const response = await fetch(url, {
         headers: {
-          'user-agent': 'npm-indexer-allinone/1.0.0',
+          'user-agent': 'npm-indexer-ultra/1.0.0',
           'accept': 'application/json',
         },
         signal: AbortSignal.timeout(CONFIG.timeout),
@@ -77,8 +74,7 @@ async function fetchWithRetry(url, maxRetries = CONFIG.maxRetries) {
     } catch (err) {
       lastError = err;
       if (attempt < maxRetries) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
   }
@@ -111,10 +107,9 @@ function loadCheckpoint() {
     try {
       const data = JSON.parse(fs.readFileSync(CONFIG.checkpointFile, 'utf8'));
       CHECKPOINT = data;
-      logger.log('[CHECKPOINT] Loaded: seq=%s, packages=%d, last=%s',
+      logger.log('[CHECKPOINT] Loaded: seq=%s, packages=%d',
         CHECKPOINT.lastSequence,
-        CHECKPOINT.totalPackages,
-        CHECKPOINT.lastUpdate
+        CHECKPOINT.totalPackages
       );
       return true;
     } catch (err) {
@@ -131,14 +126,13 @@ function saveCheckpoint(seq, totalPackages) {
   
   try {
     fs.writeFileSync(CONFIG.checkpointFile, JSON.stringify(CHECKPOINT, null, 2), 'utf8');
-    logger.log('[CHECKPOINT] Saved: seq=%s, packages=%d', seq, totalPackages);
   } catch (err) {
     logger.error('[CHECKPOINT] Save error: %s', err.message);
   }
 }
 
 // ============================================================================
-// Worker: Fetch Sequence Range
+// Ultra-Fast Worker: Process HUGE Batches
 // ============================================================================
 
 async function fetchSequenceRange(workerId, startSeq, endSeq) {
@@ -146,9 +140,9 @@ async function fetchSequenceRange(workerId, startSeq, endSeq) {
   let since = startSeq;
   let requestCount = 0;
   let errors = 0;
-  const maxErrors = 5;
+  const maxErrors = 3;
   
-  logger.log('[Worker #%d] START: seq %s → %s', workerId, startSeq, endSeq);
+  const totalRange = endSeq - startSeq;
   
   while (since < endSeq && errors < maxErrors) {
     const url = `${CONFIG.registry}/_changes?since=${since}&limit=${CONFIG.changesBatchSize}&include_docs=false`;
@@ -159,9 +153,10 @@ async function fetchSequenceRange(workerId, startSeq, endSeq) {
       
       if (results.length === 0) break;
       
+      // Fast bulk insert
       for (const change of results) {
         const id = change.id;
-        if (id && !id.startsWith('_') && !packages.has(id)) {
+        if (id && !id.startsWith('_') && !id.startsWith('design/')) {
           packages.add(id);
         }
       }
@@ -170,47 +165,57 @@ async function fetchSequenceRange(workerId, startSeq, endSeq) {
       requestCount++;
       errors = 0;
       
-      if (requestCount % 10 === 0) {
-        const progress = Math.min((since - startSeq) / (endSeq - startSeq) * 100, 100).toFixed(1);
-        logger.log('[Worker #%d] %s%% | seq: %s | packages: %d',
-          workerId, progress, since, packages.size);
+      // Progress every 5 requests (not every 10)
+      if (requestCount % 5 === 0) {
+        const progress = Math.min((since - startSeq) / totalRange * 100, 100).toFixed(1);
+        logger.log('[Worker #%d] %s%% | seq: %s | pkgs: %d | reqs: %d',
+          workerId, progress, since.toLocaleString(), packages.size, requestCount);
       }
       
       if (since >= endSeq) break;
       
-      if (CONFIG.requestDelay > 0) {
-        await new Promise(resolve => setTimeout(resolve, CONFIG.requestDelay));
-      }
+      // NO DELAY - maximum speed
+      
     } catch (err) {
       errors++;
-      logger.error('[Worker #%d] Error at seq %s: %s', workerId, since, err.message);
+      logger.error('[Worker #%d] Error: %s (attempt %d/%d)',
+        workerId, err.message, errors, maxErrors);
       
       if (errors < maxErrors) {
-        const delay = Math.min(1000 * Math.pow(2, errors), 10000);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
   }
   
-  logger.log('[Worker #%d] ✓ DONE: %d packages', workerId, packages.size);
+  logger.log('[Worker #%d] ✓ DONE: %d packages in %d requests (seq: %s → %s)',
+    workerId, packages.size, requestCount, startSeq.toLocaleString(), since.toLocaleString());
   
   return {
     workerId,
     packages: Array.from(packages),
     success: errors < maxErrors,
+    finalSeq: since,
   };
 }
 
 // ============================================================================
-// Parallel Worker Pool
+// Ultra-Fast Worker Pool
 // ============================================================================
 
 async function runWorkerPool(startSeq, maxSeq) {
+  const poolStart = Date.now();
   const workerCount = CONFIG.workers;
   const seqPerWorker = Math.ceil((maxSeq - startSeq) / workerCount);
   
-  logger.log('[POOL] Starting %d workers (seq: %s → %s)',
-    workerCount, startSeq, maxSeq);
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
+  logger.log('[POOL] Ultra-Fast Mode: %d workers × 50K batch size', workerCount);
+  logger.log('[POOL] Target: ~10 minutes for 5.4M packages');
+  logger.log('[POOL] Range: %s → %s (%s sequences)',
+    startSeq.toLocaleString(),
+    maxSeq.toLocaleString(),
+    (maxSeq - startSeq).toLocaleString()
+  );
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
   
   const workerPromises = [];
   
@@ -223,45 +228,62 @@ async function runWorkerPool(startSeq, maxSeq) {
     workerPromises.push(fetchSequenceRange(i, workerStart, workerEnd));
   }
   
-  logger.log('[POOL] Launched %d workers - RUNNING IN PARALLEL', workerPromises.length);
+  logger.log('[POOL] Launched %d workers - ALL PARALLEL, NO DELAYS', workerPromises.length);
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
   
+  // Wait for ALL workers
   const results = await Promise.all(workerPromises);
   
-  // Merge all worker results with global deduplication
-  let totalPackages = 0;
+  const poolDuration = ((Date.now() - poolStart) / 1000 / 60).toFixed(2);
+  
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
+  logger.log('[POOL] All workers complete in %s minutes', poolDuration);
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
+  
+  // Global merge with deduplication
+  let totalNewPackages = 0;
   let successfulWorkers = 0;
+  let totalRequests = 0;
   
   for (const result of results) {
     if (result.success) {
+      totalRequests += result.packages.length;
       for (const pkg of result.packages) {
         if (!TOTAL_PACKAGES.has(pkg)) {
           TOTAL_PACKAGES.add(pkg);
-          totalPackages++;
+          totalNewPackages++;
         }
       }
       successfulWorkers++;
     }
   }
   
-  logger.log('[POOL] ✓ Merge complete: %d new packages (total: %d)',
-    totalPackages, TOTAL_PACKAGES.size);
+  const throughput = Math.round(TOTAL_PACKAGES.size / parseFloat(poolDuration));
+  
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
+  logger.log('[POOL] MERGE COMPLETE');
+  logger.log('[POOL]   New packages: %s', totalNewPackages.toLocaleString());
+  logger.log('[POOL]   Total unique: %s', TOTAL_PACKAGES.size.toLocaleString());
+  logger.log('[POOL]   Successful workers: %d/%d', successfulWorkers, workerPromises.length);
+  logger.log('[POOL]   Throughput: %s packages/minute', throughput.toLocaleString());
+  logger.log('[POOL] ═══════════════════════════════════════════════════');
   
   return {
-    newPackages: totalPackages,
+    newPackages: totalNewPackages,
     totalPackages: TOTAL_PACKAGES.size,
     successfulWorkers,
-    failedWorkers: workerPromises.length - successfulWorkers,
+    duration: poolDuration,
+    throughput,
   };
 }
 
 // ============================================================================
-// Enrichment: Fetch Package Metadata
+// Optional Fast Enrichment (Batch Mode)
 // ============================================================================
 
-async function enrichPackage(packageName) {
-  const url = `${CONFIG.registry}/${encodeURIComponent(packageName)}`;
-  
+async function enrichPackageFast(packageName) {
   try {
+    const url = `${CONFIG.registry}/${encodeURIComponent(packageName)}`;
     const data = await fetchWithRetry(url);
     
     const distTags = data['dist-tags'] || {};
@@ -272,42 +294,33 @@ async function enrichPackage(packageName) {
     const versionData = data.versions?.[latestVersion];
     if (!versionData) return null;
     
-    const description = versionData.description || data.description || '';
-    const keywords = versionData.keywords || data.keywords || [];
-    const keywordsStr = Array.isArray(keywords) ? keywords.join(',') : '';
-    
     const deps = versionData.dependencies || {};
     const devDeps = versionData.devDependencies || {};
-    const dependenciesCount = Object.keys(deps).length + Object.keys(devDeps).length;
-    
-    const dist = versionData.dist || {};
-    const unpackedSize = dist.unpackedSize || 0;
-    const fileCount = dist.fileCount || 0;
-    
-    const time = data.time || {};
-    const publishTime = time[latestVersion] || time.modified || time.created;
     
     return {
-      description: description.substring(0, 10000),
-      keywords: keywordsStr.substring(0, 1000),
+      description: (versionData.description || data.description || '').substring(0, 10000),
+      keywords: (Array.isArray(versionData.keywords) ? versionData.keywords.join(',') : '').substring(0, 1000),
       latestVersion,
-      publishTime,
-      dependenciesCount,
-      fileCount,
-      unpackedSize,
+      publishTime: (data.time || {})[latestVersion],
+      dependenciesCount: Object.keys(deps).length + Object.keys(devDeps).length,
+      fileCount: (versionData.dist || {}).fileCount || 0,
+      unpackedSize: (versionData.dist || {}).unpackedSize || 0,
     };
   } catch (err) {
-    logger.error('[ENRICH] Failed %s: %s', packageName, err.message);
     return null;
   }
 }
 
-async function enrichAllPackages() {
+async function enrichAllPackagesFast() {
   const packages = Array.from(TOTAL_PACKAGES);
   const total = packages.length;
   
-  logger.log('[ENRICH] Starting enrichment for %d packages...', total);
+  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
+  logger.log('[ENRICH] Starting fast enrichment: %d packages', total);
+  logger.log('[ENRICH] Concurrency: %d parallel requests', CONFIG.enrichConcurrency);
+  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
   
+  const enrichStart = Date.now();
   let enriched = 0;
   let failed = 0;
   
@@ -315,7 +328,7 @@ async function enrichAllPackages() {
     const batch = packages.slice(i, i + CONFIG.enrichConcurrency);
     
     const promises = batch.map(async (pkg) => {
-      const metadata = await enrichPackage(pkg);
+      const metadata = await enrichPackageFast(pkg);
       if (metadata) {
         PACKAGE_METADATA.set(pkg, metadata);
         return true;
@@ -327,36 +340,44 @@ async function enrichAllPackages() {
     enriched += results.filter(r => r).length;
     failed += results.filter(r => !r).length;
     
-    if ((i + CONFIG.enrichConcurrency) % 1000 === 0 || i + CONFIG.enrichConcurrency >= total) {
+    if ((i + CONFIG.enrichConcurrency) % 5000 === 0 || i + CONFIG.enrichConcurrency >= total) {
       const progress = Math.min((i + CONFIG.enrichConcurrency) / total * 100, 100).toFixed(1);
-      const eta = ((Date.now() - startTime) / (i + CONFIG.enrichConcurrency) * (total - i - CONFIG.enrichConcurrency) / 1000 / 60).toFixed(1);
-      logger.log('[ENRICH] Progress: %s%% (%d/%d) | Enriched: %d | Failed: %d | ETA: %s min',
-        progress, i + CONFIG.enrichConcurrency, total, enriched, failed, eta);
-    }
-    
-    if (CONFIG.requestDelay > 0) {
-      await new Promise(resolve => setTimeout(resolve, CONFIG.requestDelay));
+      const elapsed = ((Date.now() - enrichStart) / 1000 / 60).toFixed(1);
+      const rate = Math.round((i + CONFIG.enrichConcurrency) / ((Date.now() - enrichStart) / 1000 / 60));
+      const eta = ((total - i - CONFIG.enrichConcurrency) / rate).toFixed(1);
+      
+      logger.log('[ENRICH] %s%% | Done: %d/%d | OK: %d | Fail: %d | Rate: %d/min | ETA: %smin',
+        progress, i + CONFIG.enrichConcurrency, total, enriched, failed, rate, eta);
     }
   }
   
-  logger.log('[ENRICH] ✓ Complete: %d enriched, %d failed', enriched, failed);
+  const enrichDuration = ((Date.now() - enrichStart) / 1000 / 60).toFixed(2);
+  
+  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
+  logger.log('[ENRICH] ✓ Complete in %s minutes', enrichDuration);
+  logger.log('[ENRICH]   Enriched: %s', enriched.toLocaleString());
+  logger.log('[ENRICH]   Failed: %s', failed.toLocaleString());
+  logger.log('[ENRICH] ═══════════════════════════════════════════════════');
 }
 
 // ============================================================================
-// CSV Export with Full Metadata
+// Ultra-Fast CSV Export (Streaming)
 // ============================================================================
 
 async function exportToCSV() {
-  logger.log('[CSV] Starting export to %s...', CONFIG.outputFile);
+  const exportStart = Date.now();
+  logger.log('[CSV] ═══════════════════════════════════════════════════');
+  logger.log('[CSV] Exporting to: %s', CONFIG.outputFile);
   
   const packages = Array.from(TOTAL_PACKAGES).sort();
   const writeStream = fs.createWriteStream(CONFIG.outputFile, { encoding: 'utf8' });
   
   // Write header
-  const header = 'number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n';
-  writeStream.write(header);
+  writeStream.write('number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n');
   
   let rowNumber = 0;
+  const batchSize = 1000;
+  let buffer = '';
   
   for (const pkg of packages) {
     rowNumber++;
@@ -370,18 +391,30 @@ async function exportToCSV() {
       metadata.fileCount || 0,
       metadata.unpackedSize || 0,
       metadata.dependenciesCount || 0,
-      0, // dependents (would require additional query)
+      0,
       formatDate(metadata.publishTime),
       escapeCSV(metadata.description || ''),
       escapeCSV(metadata.keywords || ''),
     ].join(',') + '\n';
     
-    writeStream.write(row);
+    buffer += row;
     
-    if (rowNumber % 10000 === 0) {
-      const progress = (rowNumber / packages.length * 100).toFixed(1);
-      logger.log('[CSV] Progress: %s%% (%d/%d)', progress, rowNumber, packages.length);
+    // Flush buffer every 1000 rows
+    if (rowNumber % batchSize === 0) {
+      writeStream.write(buffer);
+      buffer = '';
+      
+      if (rowNumber % 100000 === 0) {
+        const progress = (rowNumber / packages.length * 100).toFixed(1);
+        logger.log('[CSV] %s%% | Rows: %s/%s',
+          progress, rowNumber.toLocaleString(), packages.length.toLocaleString());
+      }
     }
+  }
+  
+  // Write remaining buffer
+  if (buffer) {
+    writeStream.write(buffer);
   }
   
   writeStream.end();
@@ -392,11 +425,17 @@ async function exportToCSV() {
   });
   
   const fileSizeMB = (fs.statSync(CONFIG.outputFile).size / 1024 / 1024).toFixed(2);
-  logger.log('[CSV] ✓ Complete: %d rows, %s MB', rowNumber, fileSizeMB);
+  const exportDuration = ((Date.now() - exportStart) / 1000).toFixed(1);
+  
+  logger.log('[CSV] ═══════════════════════════════════════════════════');
+  logger.log('[CSV] ✓ Complete in %s seconds', exportDuration);
+  logger.log('[CSV]   Rows: %s', rowNumber.toLocaleString());
+  logger.log('[CSV]   Size: %s MB', fileSizeMB);
+  logger.log('[CSV] ═══════════════════════════════════════════════════');
   
   // Show sample
-  const sample = fs.readFileSync(CONFIG.outputFile, 'utf8').split('\n').slice(0, 7).join('\n');
-  logger.log('[CSV] Sample:\n%s', sample);
+  const sample = fs.readFileSync(CONFIG.outputFile, 'utf8').split('\n').slice(0, 6).join('\n');
+  logger.log('[CSV] Sample output:\n%s', sample);
 }
 
 // ============================================================================
@@ -408,18 +447,19 @@ let startTime;
 async function main() {
   startTime = Date.now();
   
-  logger.log('═══════════════════════════════════════════════════════');
-  logger.log('NPM Registry Complete Indexer - All-in-One Edition');
-  logger.log('═══════════════════════════════════════════════════════');
+  logger.log('═══════════════════════════════════════════════════════════════');
+  logger.log('NPM Registry ULTRA-FAST Indexer - 10 Minute Target');
+  logger.log('═══════════════════════════════════════════════════════════════');
   logger.log('Configuration:');
   logger.log('  Registry: %s', CONFIG.registry);
-  logger.log('  Workers: %d parallel', CONFIG.workers);
+  logger.log('  Workers: %d parallel (NO DELAYS)', CONFIG.workers);
+  logger.log('  Batch size: %s records per request', CONFIG.changesBatchSize.toLocaleString());
+  logger.log('  Enrichment: %s', CONFIG.skipEnrichment ? 'SKIP (fastest)' : `YES (${CONFIG.enrichConcurrency} concurrent)`);
   logger.log('  Output: %s', CONFIG.outputFile);
-  logger.log('  Checkpoint: %s', CONFIG.checkpointFile);
-  logger.log('═══════════════════════════════════════════════════════');
+  logger.log('═══════════════════════════════════════════════════════════════');
   
   try {
-    // Load checkpoint if exists
+    // Load checkpoint
     const hasCheckpoint = loadCheckpoint();
     
     // Get registry info
@@ -428,54 +468,44 @@ async function main() {
     const maxSeq = rootData.update_seq || 0;
     const docCount = rootData.doc_count || 0;
     
-    logger.log('[INIT] Registry max sequence: %s', maxSeq.toLocaleString());
-    logger.log('[INIT] Registry doc count: %s', docCount.toLocaleString());
+    logger.log('[INIT] Registry: %s sequences, %s packages',
+      maxSeq.toLocaleString(), docCount.toLocaleString());
     
     // Determine start sequence
     const startSeq = hasCheckpoint ? CHECKPOINT.lastSequence : 0;
     
     if (hasCheckpoint && startSeq >= maxSeq) {
-      logger.log('[SYNC] Already up to date! (seq: %s)', startSeq);
-      logger.log('[SYNC] No new packages to fetch.');
+      logger.log('[SYNC] Already up to date!');
       process.exit(0);
     }
     
-    if (hasCheckpoint) {
-      logger.log('[SYNC] Resuming from sequence: %s', startSeq);
-      logger.log('[SYNC] Fetching changes: %s → %s', startSeq, maxSeq);
-    } else {
-      logger.log('[INIT] Starting fresh index...');
-    }
-    
-    // Step 1: Fetch packages with worker pool
-    logger.log('═══════════════════════════════════════════════════════');
-    logger.log('[STEP 1/3] FETCHING PACKAGES (%d workers)', CONFIG.workers);
-    logger.log('═══════════════════════════════════════════════════════');
+    // STEP 1: Ultra-Fast Fetch with 100 workers
+    logger.log('═══════════════════════════════════════════════════════════════');
+    logger.log('[STEP 1/3] ULTRA-FAST FETCH (%d workers, 50K batches)', CONFIG.workers);
+    logger.log('═══════════════════════════════════════════════════════════════');
     
     const poolResult = await runWorkerPool(startSeq, maxSeq);
     
-    logger.log('[FETCH] ✓ Complete:');
-    logger.log('[FETCH]   New packages: %d', poolResult.newPackages);
-    logger.log('[FETCH]   Total packages: %d', poolResult.totalPackages);
-    logger.log('[FETCH]   Successful workers: %d/%d',
-      poolResult.successfulWorkers,
-      poolResult.successfulWorkers + poolResult.failedWorkers
-    );
-    
-    // Save checkpoint after fetch
+    // Save checkpoint
     saveCheckpoint(maxSeq, poolResult.totalPackages);
     
-    // Step 2: Enrich metadata
-    logger.log('═══════════════════════════════════════════════════════');
-    logger.log('[STEP 2/3] ENRICHING METADATA (%d packages)', poolResult.totalPackages);
-    logger.log('═══════════════════════════════════════════════════════');
+    // STEP 2: Optional Fast Enrichment
+    if (!CONFIG.skipEnrichment) {
+      logger.log('═══════════════════════════════════════════════════════════════');
+      logger.log('[STEP 2/3] FAST ENRICHMENT (%d concurrent)', CONFIG.enrichConcurrency);
+      logger.log('═══════════════════════════════════════════════════════════════');
+      
+      await enrichAllPackagesFast();
+    } else {
+      logger.log('═══════════════════════════════════════════════════════════════');
+      logger.log('[STEP 2/3] ENRICHMENT SKIPPED (maximum speed mode)');
+      logger.log('═══════════════════════════════════════════════════════════════');
+    }
     
-    await enrichAllPackages();
-    
-    // Step 3: Export CSV
-    logger.log('═══════════════════════════════════════════════════════');
-    logger.log('[STEP 3/3] EXPORTING CSV');
-    logger.log('═══════════════════════════════════════════════════════');
+    // STEP 3: Fast CSV Export
+    logger.log('═══════════════════════════════════════════════════════════════');
+    logger.log('[STEP 3/3] CSV EXPORT');
+    logger.log('═══════════════════════════════════════════════════════════════');
     
     await exportToCSV();
     
@@ -483,25 +513,32 @@ async function main() {
     const totalDuration = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
     const throughput = Math.round(poolResult.totalPackages / parseFloat(totalDuration));
     
-    logger.log('═══════════════════════════════════════════════════════');
+    logger.log('═══════════════════════════════════════════════════════════════');
     logger.log('✓✓✓ COMPLETE ✓✓✓');
-    logger.log('═══════════════════════════════════════════════════════');
-    logger.log('Duration: %s minutes', totalDuration);
-    logger.log('Total packages: %s', poolResult.totalPackages.toLocaleString());
+    logger.log('═══════════════════════════════════════════════════════════════');
+    logger.log('Total Duration: %s minutes', totalDuration);
+    logger.log('Total Packages: %s', poolResult.totalPackages.toLocaleString());
     logger.log('Throughput: %s packages/minute', throughput.toLocaleString());
     logger.log('Output: %s', CONFIG.outputFile);
-    logger.log('Checkpoint: seq=%s (for next sync)', maxSeq);
-    logger.log('═══════════════════════════════════════════════════════');
-    logger.log('');
-    logger.log('To sync to latest: just run this script again!');
-    logger.log('  node %s', path.basename(__filename));
+    logger.log('Checkpoint: seq=%s', maxSeq.toLocaleString());
+    logger.log('═══════════════════════════════════════════════════════════════');
+    
+    if (parseFloat(totalDuration) <= 10) {
+      logger.log('🚀 TARGET ACHIEVED: Complete in under 10 minutes!');
+    } else if (parseFloat(totalDuration) <= 15) {
+      logger.log('⚡ EXCELLENT: Complete in under 15 minutes!');
+    } else {
+      logger.log('✓ Complete! Run with skipEnrichment:true for <10 min target');
+    }
+    
+    logger.log('═══════════════════════════════════════════════════════════════');
     
     process.exit(0);
     
   } catch (err) {
-    logger.error('═══════════════════════════════════════════════════════');
+    logger.error('═══════════════════════════════════════════════════════════════');
     logger.error('✗✗✗ FAILED ✗✗✗');
-    logger.error('═══════════════════════════════════════════════════════');
+    logger.error('═══════════════════════════════════════════════════════════════');
     logger.error('Error: %s', err.message);
     logger.error('Stack: %s', err.stack);
     process.exit(1);
