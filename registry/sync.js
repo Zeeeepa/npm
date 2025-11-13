@@ -28,7 +28,7 @@ class RegistrySync {
    */
   async getCurrentSequence() {
     try {
-      const response = await axios.get(`${REGISTRY_URL}//`, {
+      const response = await axios.get(`${REGISTRY_URL}/`, {
         timeout: REQUEST_TIMEOUT
       });
       return response.data.update_seq;

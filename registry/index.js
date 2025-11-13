@@ -30,7 +30,7 @@ class RegistryIndexer {
     console.log('[INIT] Fetching registry metadata...');
     
     try {
-      const response = await axios.get(`${REGISTRY_URL}//`, {
+      const response = await axios.get(`${REGISTRY_URL}/`, {
         timeout: REQUEST_TIMEOUT
       });
 
