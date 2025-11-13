@@ -1,0 +1,86 @@
+{
+  "packages": [
+    {
+      "name": "lodash",
+      "scope": null,
+      "state": "indexed"
+    },
+    {
+      "name": "@babel/core",
+      "scope": "@babel",
+      "state": "indexed"
+    },
+    {
+      "name": "react",
+      "scope": null,
+      "state": "synced"
+    },
+    {
+      "name": "@types/node",
+      "scope": "@types",
+      "state": "enriched"
+    }
+  ],
+  "metadata": [
+    {
+      "package_name": "lodash",
+      "description": "Lodash modular utilities.",
+      "keywords": "modules, stdlib, util",
+      "latest_version": "4.17.21",
+      "publish_time": "2021-02-20T16:41:44.000Z",
+      "dependencies_count": 0,
+      "file_count": 1054,
+      "unpacked_size": 1413487,
+      "npm_url": "https://www.npmjs.com/package/lodash"
+    },
+    {
+      "package_name": "@babel/core",
+      "description": "Babel compiler core.",
+      "keywords": "6to5, babel, classes, const, es6, harmony, let, modules, transpile, transpiler, var, babel-core, compiler",
+      "latest_version": "7.24.0",
+      "publish_time": "2024-02-28T15:08:36.000Z",
+      "dependencies_count": 15,
+      "file_count": 234,
+      "unpacked_size": 2450000,
+      "npm_url": "https://www.npmjs.com/package/@babel/core"
+    },
+    {
+      "package_name": "react",
+      "description": "React is a JavaScript library for building user interfaces.",
+      "keywords": "react",
+      "latest_version": "18.2.0",
+      "publish_time": "2022-06-14T21:00:24.000Z",
+      "dependencies_count": 2,
+      "file_count": 89,
+      "unpacked_size": 305000,
+      "npm_url": "https://www.npmjs.com/package/react"
+    }
+  ],
+  "registry_changes": [
+    {
+      "seq": 1,
+      "type": "PACKAGE_VERSION_ADDED",
+      "id": "lodash",
+      "changes": [{"version": "4.17.21"}]
+    },
+    {
+      "seq": 2,
+      "type": "PACKAGE_VERSION_ADDED",
+      "id": "@babel/core",
+      "changes": [{"version": "7.24.0"}]
+    },
+    {
+      "seq": 3,
+      "type": "PACKAGE_TAG_ADDED",
+      "id": "lodash",
+      "changes": [{"tag": "latest"}]
+    },
+    {
+      "seq": 4,
+      "type": "PACKAGE_VERSION_ADDED",
+      "id": "react",
+      "changes": [{"version": "18.2.0"}]
+    }
+  ]
+}
+
