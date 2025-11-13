@@ -266,7 +266,7 @@ async function getInitialSince() {
   try {
     const data = await fetchWithRetry(`${CONFIG.registry}/`);
     const updateSeq = data.update_seq || 0;
-    const since = String(Math.max(0, updateSeq - 10));
+    const since = '0'; // Start from 0 for FULL index
     logger.log('[INIT] Initial since: %s (update_seq: %s)', since, updateSeq);
     return since;
   } catch (err) {
