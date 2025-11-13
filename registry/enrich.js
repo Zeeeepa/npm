@@ -124,14 +124,46 @@ class MetadataEnricher {
   }
 
   /**
+   * Check if package meets age criteria
+   * @param {object} packageData - Full package data from registry
+   * @param {number} maxAgeDays - Maximum age in days (0 = no filter)
+   * @returns {boolean} - True if package meets criteria
+   */
+  checkPackageAge(packageData, maxAgeDays) {
+    if (maxAgeDays === 0) return true; // No age filter
+    
+    try {
+      const latestVersion = packageData['dist-tags']?.latest;
+      if (!latestVersion || !packageData.time?.[latestVersion]) {
+        return false; // Skip if no publish date
+      }
+      
+      const publishDate = new Date(packageData.time[latestVersion]);
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - maxAgeDays);
+      
+      return publishDate >= cutoffDate;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
    * Enrich single package
    * @param {object} pkg - Package record
+   * @param {number} maxAgeDays - Maximum age filter (0 = no filter)
    * @returns {Promise<boolean>} - Success status
    */
-  async enrichPackage(pkg) {
+  async enrichPackage(pkg, maxAgeDays = 0) {
     try {
       // Fetch package metadata
       const packageData = await this.fetchPackageMetadata(pkg.name);
+      
+      // Check age filter if specified
+      if (maxAgeDays > 0 && !this.checkPackageAge(packageData, maxAgeDays)) {
+        this.stats.skipped++;
+        return false; // Skip old packages
+      }
       
       // Extract metadata
       const metadata = this.extractMetadata(packageData, pkg.name);
@@ -154,16 +186,17 @@ class MetadataEnricher {
   /**
    * Enrich packages in batches with concurrency control
    * @param {array} packages - Array of package records
+   * @param {number} maxAgeDays - Maximum age filter (0 = no filter)
    * @returns {Promise<void>}
    */
-  async enrichBatch(packages) {
+  async enrichBatch(packages, maxAgeDays = 0) {
     const promises = [];
     
     for (let i = 0; i < packages.length; i++) {
       const pkg = packages[i];
       
       // Add to promises pool
-      const promise = this.enrichPackage(pkg).then(() => {
+      const promise = this.enrichPackage(pkg, maxAgeDays).then(() => {
         // Small delay between requests
         return this._sleep(REQUEST_DELAY);
       });
@@ -192,7 +225,8 @@ class MetadataEnricher {
   async run(options = {}) {
     const {
       targetStates = ['indexed', 'synced'],
-      resumeFrom = 0
+      resumeFrom = 0,
+      maxAgeDays = 0  // 0 = no filter, >0 = only packages published within last N days
     } = options;
 
     console.log('═══════════════════════════════════════════════════════');
@@ -202,6 +236,13 @@ class MetadataEnricher {
     console.log('[CONFIG] Batch size:', BATCH_SIZE);
     console.log('[CONFIG] Concurrency:', CONCURRENCY);
     console.log('[CONFIG] Target states:', targetStates.join(', '));
+    if (maxAgeDays > 0) {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - maxAgeDays);
+      console.log(`[CONFIG] Age filter: ${maxAgeDays} days (packages after ${cutoffDate.toISOString().split('T')[0]})`);
+    } else {
+      console.log('[CONFIG] Age filter: DISABLED (all packages)');
+    }
     console.log('═══════════════════════════════════════════════════════');
 
     const startTime = Date.now();
@@ -247,7 +288,7 @@ class MetadataEnricher {
         }
 
         // Enrich batch
-        await this.enrichBatch(batch);
+        await this.enrichBatch(batch, maxAgeDays);
 
         this.stats.total += batch.length;
         offset += batch.length;
@@ -331,6 +372,7 @@ Usage: node enrich.js [options]
 
 Options:
   --resume-from <offset>    Resume from specific offset (default: 0)
+  --max-age <days>          Only enrich packages published within last N days (default: 0 = all)
   --help, -h                Show this help message
 
 Environment Variables:
@@ -343,6 +385,7 @@ Environment Variables:
 Examples:
   node enrich.js
   node enrich.js --resume-from 10000
+  node enrich.js --max-age 365
   ENRICH_CONCURRENCY=20 node enrich.js
       `);
       process.exit(0);
@@ -366,4 +409,3 @@ Examples:
 }
 
 export default MetadataEnricher;
-

@@ -1,292 +1,145 @@
 /**
- * Initial Registry Indexer
- * Fetches complete npm registry from _changes endpoint
+ * Full npm registry indexer using CNPM Chinese mirror
+ * CNPM contains ~5.4M packages (vs 3.7M on official npm)
+ * Includes all official npm packages + Chinese community packages
  */
 
-import axios from 'axios';
 import RegistryDB from './db.js';
+import axios from 'axios';
 
-const REGISTRY_URL = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 10000;
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 60000;
+// CNPM Chinese mirror - best for complete package coverage
+const REGISTRY_URL = 'https://r.cnpmjs.org';
+const REGISTRY_API = 'https://registry.npmmirror.com';
+const BATCH_SIZE = 1000;
 
-class RegistryIndexer {
-  constructor(dbPath = null) {
-    this.db = new RegistryDB(dbPath);
-    this.seenPackages = new Set();
-    this.stats = {
-      totalRecords: 0,
-      uniquePackages: 0,
-      duplicatesAvoided: 0,
-      lastSequence: 0
-    };
-  }
+console.log(`\n${'='.repeat(80)}`);
+console.log('📦 NPM REGISTRY FULL INDEX - CNPM MIRROR (5.4M+ packages)');
+console.log(`${'='.repeat(80)}`);
+console.log(`🌏 Using CNPM Chinese mirror: ${REGISTRY_URL}`);
+console.log(`📡 API endpoint: ${REGISTRY_API}`);
+console.log(`${'='.repeat(80)}\n`);
 
-  /**
-   * Fetch registry metadata
-   * @returns {Promise<object>} - Registry metadata
-   */
-  async fetchRegistryInfo() {
-    console.log('[INIT] Fetching registry metadata...');
+async function runFullIndex() {
+  const db = new RegistryDB('./npm-registry.db');
+  db.connect();
+
+  console.log('[INDEX] Starting full registry scan...\n');
+  
+  const allPackages = new Set();
+  let recordCount = 0;
+  let lastSeq = 0;
+
+  try {
+    // Get total registry size from CNPM
+    const rootResponse = await axios.get(`${REGISTRY_API}/`, {
+      timeout: 30000
+    });
     
-    try {
-      const response = await axios.get(`${REGISTRY_URL}/`, {
-        timeout: REQUEST_TIMEOUT
-      });
+    const totalSequence = rootResponse.data.update_seq;
+    const totalPackages = rootResponse.data.doc_count;
+    
+    console.log(`[INDEX] 📊 CNPM Registry Stats:`);
+    console.log(`  - Total packages: ${totalPackages.toLocaleString()}`);
+    console.log(`  - Update sequence: ${totalSequence.toLocaleString()}`);
+    console.log(`  - Last package: ${rootResponse.data.last_package}`);
+    console.log();
 
-      const { update_seq } = response.data;
-      
-      console.log(`[INIT] Registry max sequence: ${update_seq.toLocaleString()}`);
-      console.log(`[INIT] Registry doc count: ${response.data.doc_count.toLocaleString()}`);
-
-      
-      return { maxSequence: update_seq };
-    } catch (error) {
-      console.error('[INIT] Error fetching registry info:', error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Fetch changes from registry
-   * @param {number} since - Starting sequence number
-   * @param {number} limit - Batch size
-   * @returns {Promise<object>} - Changes data
-   */
-  async fetchChanges(since = 0, limit = BATCH_SIZE) {
-    try {
+    // Fetch all changes from CNPM changes feed
+    let since = 0;
+    const startTime = Date.now();
+    
+    console.log('[INDEX] Fetching package changes from CNPM...\n');
+    
+    while (true) {
       const response = await axios.get(`${REGISTRY_URL}/_changes`, {
         params: {
           since,
-          limit,
-          include_docs: false
+          limit: BATCH_SIZE
         },
-        timeout: REQUEST_TIMEOUT
+        timeout: 30000
       });
 
-      return response.data;
-    } catch (error) {
-      // Retry logic
-      console.warn(`[FETCH] Request failed for sequence ${since}, retrying...`);
-      await this._sleep(2000);
-      
-      try {
-        const response = await axios.get(`${REGISTRY_URL}/_changes`, {
-          params: { since, limit, include_docs: false },
-          timeout: REQUEST_TIMEOUT
-        });
-        return response.data;
-      } catch (retryError) {
-        console.error(`[FETCH] Retry failed for sequence ${since}:`, retryError.message);
-        throw retryError;
-      }
-    }
-  }
-
-  /**
-   * Process changes and deduplicate
-   * @param {array} results - Changes results
-   * @returns {number} - Number of new unique packages
-   */
-  processChanges(results) {
-    let newPackages = 0;
-
-    for (const change of results) {
-      this.stats.totalRecords++;
-      
-      const packageName = change.id;
-      
-      if (!this.seenPackages.has(packageName)) {
-        this.seenPackages.add(packageName);
-        newPackages++;
-        this.stats.uniquePackages++;
-      } else {
-        this.stats.duplicatesAvoided++;
+      if (!response.data.results || response.data.results.length === 0) {
+        console.log('[INDEX] ✅ Reached end of changes feed');
+        break;
       }
 
-      // Update last sequence
-      if (change.seq > this.stats.lastSequence) {
-        this.stats.lastSequence = change.seq;
+      // Collect all package names
+      for (const change of response.data.results) {
+        if (change.id && !change.id.startsWith('_design/')) {
+          allPackages.add(change.id);
+        }
+        recordCount++;
+        lastSeq = change.seq;
       }
+
+      since = response.data.last_seq || lastSeq;
+      
+      const progress = (recordCount / totalSequence * 100).toFixed(1);
+      const rate = Math.round(recordCount / ((Date.now() - startTime) / 1000));
+      const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+      
+      console.log(`[FETCH] Batch ${Math.ceil(recordCount / BATCH_SIZE)} | Records: ${recordCount.toLocaleString()} | Unique: ${allPackages.size.toLocaleString()} | Progress: ${progress}% | Rate: ${rate}/s | Time: ${elapsed}min`);
     }
 
-    return newPackages;
-  }
+    console.log(`\n[INDEX] ✅ Fetch complete!`);
+    console.log(`  Total records: ${recordCount.toLocaleString()}`);
+    console.log(`  Unique packages: ${allPackages.size.toLocaleString()}`);
+    console.log(`  Expected: ${totalPackages.toLocaleString()}`);
+    console.log(`  Coverage: ${(allPackages.size / totalPackages * 100).toFixed(1)}%`);
 
-  /**
-   * Store packages in database
-   * @param {Set} packages - Set of package names
-   * @returns {Promise<number>} - Number of packages stored
-   */
-  async storePackages(packages) {
-    const packageArray = Array.from(packages);
+    // Insert all packages into database
+    console.log('\n[INDEX] Inserting packages into database...');
     
-    if (packageArray.length === 0) {
-      return 0;
-    }
-
-    const inserted = this.db.insertPackagesBatch(packageArray, 'indexed');
-    return inserted;
-  }
-
-  /**
-   * Run full index operation
-   * @returns {Promise<object>} - Indexing statistics
-   */
-  async run() {
-    console.log('═══════════════════════════════════════════════════════');
-    console.log('NPM Registry Indexer - Initial Full Index');
-    console.log('═══════════════════════════════════════════════════════');
-    console.log('[CONFIG] Registry:', REGISTRY_URL);
-    console.log('[CONFIG] Batch size:', BATCH_SIZE);
-    console.log('═══════════════════════════════════════════════════════');
-
-    const startTime = Date.now();
-
-    // Connect to database
-    this.db.connect();
-
-    // Check if already indexed
-    const checkpoint = this.db.getCheckpoint();
-    if (checkpoint.update_sequence > 0) {
-      console.log(`[WARN] Database already contains ${checkpoint.total_packages} packages`);
-      console.log('[WARN] Last sequence:', checkpoint.update_sequence);
-      console.log('[WARN] Use sync.js for incremental updates');
-      console.log('[WARN] To re-index, delete the database file and run again');
+    let inserted = 0;
+    const insertStart = Date.now();
+    
+    for (const packageName of allPackages) {
+      db.insertPackage(packageName, 'indexed');
+      inserted++;
       
-      const stats = this.db.getStats();
-      console.log('\nCurrent database statistics:');
-      console.log('  Total packages:', stats.total);
-      console.log('  Indexed:', stats.indexed);
-      console.log('  Synced:', stats.synced);
-      console.log('  Enriched:', stats.enriched);
-      
-      this.db.close();
-      return stats;
-    }
-
-    try {
-      // Fetch registry info
-      const { maxSequence } = await this.fetchRegistryInfo();
-
-      // Fetch changes in batches
-      let currentSequence = 0;
-      let batchCount = 0;
-      let lastReportTime = Date.now();
-
-      console.log('═══════════════════════════════════════════════════════');
-      console.log('[STEP 1/2] FETCHING PACKAGES');
-      console.log('═══════════════════════════════════════════════════════');
-
-      while (currentSequence < maxSequence) {
-        batchCount++;
-        
-        // Fetch batch
-        const changesData = await this.fetchChanges(currentSequence, BATCH_SIZE);
-        
-        if (!changesData.results || changesData.results.length === 0) {
-          break;
-        }
-
-        // Process and deduplicate
-        const newPackages = this.processChanges(changesData.results);
-
-        // Update sequence
-        currentSequence = changesData.update_seq || this.stats.lastSequence;
-
-        // Progress reporting (every 50k records or 10 seconds)
-        const now = Date.now();
-        if (this.stats.totalRecords % 50000 === 0 || now - lastReportTime > 10000) {
-          const elapsed = (now - startTime) / 1000;
-          const rate = Math.round(this.stats.totalRecords / elapsed);
-          const progress = ((currentSequence / maxSequence) * 100).toFixed(1);
-          
-          console.log(
-            `[FETCH] Batch ${batchCount} | ` +
-            `Records: ${this.stats.totalRecords.toLocaleString()} | ` +
-            `Unique: ${this.stats.uniquePackages.toLocaleString()} | ` +
-            `Progress: ${progress}% | ` +
-            `Rate: ${rate.toLocaleString()}/s`
-          );
-          
-          lastReportTime = now;
-        }
-
-        // Small delay to avoid overwhelming the registry
-        await this._sleep(10);
+      if (inserted % 10000 === 0) {
+        const insertRate = Math.round(inserted / ((Date.now() - insertStart) / 1000));
+        console.log(`[INSERT] ${inserted.toLocaleString()} packages | Rate: ${insertRate}/s`);
       }
-
-      console.log('═══════════════════════════════════════════════════════');
-      console.log('[FETCH] Complete!');
-      console.log(`[FETCH] Total records seen: ${this.stats.totalRecords.toLocaleString()}`);
-      console.log(`[FETCH] Unique packages: ${this.stats.uniquePackages.toLocaleString()}`);
-      console.log(`[FETCH] Duplicates avoided: ${this.stats.duplicatesAvoided.toLocaleString()}`);
-      console.log(`[FETCH] Deduplication efficiency: ${((this.stats.uniquePackages / this.stats.totalRecords) * 100).toFixed(1)}%`);
-      console.log('═══════════════════════════════════════════════════════');
-
-      // Store in database
-      console.log('[STEP 2/2] STORING IN DATABASE');
-      console.log('═══════════════════════════════════════════════════════');
-      
-      const storeStartTime = Date.now();
-      const inserted = await this.storePackages(this.seenPackages);
-      const storeDuration = ((Date.now() - storeStartTime) / 1000).toFixed(2);
-      
-      console.log(`[DB] Stored ${inserted.toLocaleString()} packages in ${storeDuration}s`);
-
-      // Update checkpoint
-      this.db.updateCheckpoint(this.stats.lastSequence, this.stats.uniquePackages);
-      console.log(`[DB] Checkpoint updated: sequence=${this.stats.lastSequence}`);
-
-      // Final statistics
-      const totalDuration = ((Date.now() - startTime) / 60000).toFixed(2);
-      
-      console.log('═══════════════════════════════════════════════════════');
-      console.log('✓✓✓ INDEXING COMPLETE ✓✓✓');
-      console.log('═══════════════════════════════════════════════════════');
-      console.log(`Duration: ${totalDuration} minutes`);
-      console.log(`Packages indexed: ${this.stats.uniquePackages.toLocaleString()}`);
-      console.log(`Final sequence: ${this.stats.lastSequence.toLocaleString()}`);
-      console.log(`Throughput: ${Math.round(this.stats.uniquePackages / (totalDuration * 60)).toLocaleString()} packages/second`);
-      console.log('═══════════════════════════════════════════════════════');
-      console.log('\nNext steps:');
-      console.log('  1. Run sync.js for incremental updates');
-      console.log('  2. Run enrich.js to add metadata');
-      console.log('  3. Run csv.js to export to CSV');
-      console.log('═══════════════════════════════════════════════════════');
-
-      return this.stats;
-    } catch (error) {
-      console.error('[ERROR] Indexing failed:', error);
-      throw error;
-    } finally {
-      this.db.close();
     }
-  }
 
-  /**
-   * Sleep helper
-   * @param {number} ms - Milliseconds to sleep
-   */
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    // Update checkpoint
+    db.updateCheckpoint(lastSeq, allPackages.size);
+
+    // Show final stats
+    const stats = db.getStats();
+    const checkpoint = db.getCheckpoint();
+    const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+    
+    console.log('\n' + '='.repeat(80));
+    console.log('✅ INDEX COMPLETE!');
+    console.log('='.repeat(80));
+    console.log(`📦 Total packages indexed: ${stats.total.toLocaleString()}`);
+    console.log(`📊 State breakdown:`);
+    console.log(`   - Indexed: ${stats.indexed.toLocaleString()}`);
+    console.log(`   - Synced: ${stats.synced.toLocaleString()}`);
+    console.log(`   - Enriched: ${stats.enriched.toLocaleString()}`);
+    console.log(`🔖 Checkpoint: sequence ${checkpoint.last_sequence.toLocaleString()}`);
+    console.log(`⏱️  Total duration: ${totalTime} minutes`);
+    console.log(`📈 Average rate: ${Math.round(recordCount / (totalTime * 60))}/s`);
+    console.log('='.repeat(80));
+    console.log('\n💡 Next steps:');
+    console.log('   1. Run: node enrich.js --max-age 365  (to enrich recent packages)');
+    console.log('   2. Run: node csv.js --state enriched   (to export to CSV)');
+    console.log('   3. Run: node sync.js                   (for incremental updates)');
+
+  } catch (error) {
+    console.error('[INDEX] ❌ Error:', error.message);
+    if (error.response) {
+      console.error('[INDEX] Response status:', error.response.status);
+      console.error('[INDEX] Response data:', error.response.data);
+    }
+    throw error;
+  } finally {
+    db.close();
   }
 }
 
-// CLI execution
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const indexer = new RegistryIndexer();
-  
-  indexer.run()
-    .then(() => {
-      console.log('\n✓ Indexing completed successfully');
-      process.exit(0);
-    })
-    .catch(error => {
-      console.error('\n✗ Indexing failed:', error);
-      process.exit(1);
-    });
-}
-
-export default RegistryIndexer;
+runFullIndex();
 
