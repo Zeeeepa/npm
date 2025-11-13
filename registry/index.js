@@ -30,15 +30,17 @@ class RegistryIndexer {
     console.log('[INIT] Fetching registry metadata...');
     
     try {
-      const response = await axios.get(`${REGISTRY_URL}/_changes?limit=0`, {
+      const response = await axios.get(`${REGISTRY_URL}//`, {
         timeout: REQUEST_TIMEOUT
       });
 
-      const { last_seq } = response.data;
+      const { update_seq } = response.data;
       
-      console.log(`[INIT] Registry max sequence: ${last_seq.toLocaleString()}`);
+      console.log(`[INIT] Registry max sequence: ${update_seq.toLocaleString()}`);
+      console.log(`[INIT] Registry doc count: ${response.data.doc_count.toLocaleString()}`);
+
       
-      return { maxSequence: last_seq };
+      return { maxSequence: update_seq };
     } catch (error) {
       console.error('[INIT] Error fetching registry info:', error.message);
       throw error;
@@ -146,9 +148,9 @@ class RegistryIndexer {
 
     // Check if already indexed
     const checkpoint = this.db.getCheckpoint();
-    if (checkpoint.last_sequence > 0) {
+    if (checkpoint.update_sequence > 0) {
       console.log(`[WARN] Database already contains ${checkpoint.total_packages} packages`);
-      console.log('[WARN] Last sequence:', checkpoint.last_sequence);
+      console.log('[WARN] Last sequence:', checkpoint.update_sequence);
       console.log('[WARN] Use sync.js for incremental updates');
       console.log('[WARN] To re-index, delete the database file and run again');
       
@@ -190,7 +192,7 @@ class RegistryIndexer {
         const newPackages = this.processChanges(changesData.results);
 
         // Update sequence
-        currentSequence = changesData.last_seq || this.stats.lastSequence;
+        currentSequence = changesData.update_seq || this.stats.lastSequence;
 
         // Progress reporting (every 50k records or 10 seconds)
         const now = Date.now();

@@ -28,10 +28,10 @@ class RegistrySync {
    */
   async getCurrentSequence() {
     try {
-      const response = await axios.get(`${REGISTRY_URL}/_changes?limit=0`, {
+      const response = await axios.get(`${REGISTRY_URL}//`, {
         timeout: REQUEST_TIMEOUT
       });
-      return response.data.last_seq;
+      return response.data.update_seq;
     } catch (error) {
       console.error('[SYNC] Error fetching current sequence:', error.message);
       throw error;
@@ -122,7 +122,7 @@ class RegistrySync {
     try {
       // Get last checkpoint
       const checkpoint = this.db.getCheckpoint();
-      this.stats.startSequence = checkpoint.last_sequence;
+      this.stats.startSequence = checkpoint.update_sequence;
 
       if (this.stats.startSequence === 0) {
         console.log('[ERROR] No checkpoint found. Run index.js first to create initial index.');
@@ -168,7 +168,7 @@ class RegistrySync {
         await this.processChanges(changesData.results);
 
         // Update current sequence
-        currentSeq = changesData.last_seq || this.stats.endSequence;
+        currentSeq = changesData.update_seq || this.stats.endSequence;
 
         // Progress reporting
         const now = Date.now();
