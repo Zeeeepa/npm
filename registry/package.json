@@ -1,0 +1,32 @@
+{
+  "name": "npm-registry-indexer",
+  "version": "1.0.0",
+  "description": "Complete npm registry indexer with SQL storage and filtered CSV exports",
+  "type": "module",
+  "scripts": {
+    "index": "node index.js",
+    "sync": "node sync.js",
+    "enrich": "node enrich.js",
+    "export": "node csv.js",
+    "full": "npm run index && npm run enrich && npm run export"
+  },
+  "keywords": [
+    "npm",
+    "registry",
+    "indexer",
+    "scraper",
+    "packages"
+  ],
+  "author": "Zeeeepa",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^9.2.2",
+    "axios": "^1.6.5",
+    "csv-stringify": "^6.4.6",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
