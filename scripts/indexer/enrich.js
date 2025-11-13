@@ -1,23 +1,28 @@
 'use strict';
 
 /**
- * NPM Package Enricher - Production Edition
+ * NPM Package Enricher v2.0 - DEDUPLICATED & SMART UPDATES
  * Author: Zeeeepa
  * Date: 2025-11-13
  * 
- * PURPOSE:
- * - Reads npm.csv from same directory
- * - Enriches missing metadata for each package
- * - Upserts back to npm.csv atomically
- * - Maintains checkpoint with sequence for incremental updates
+ * CRITICAL FIXES:
+ * - ✅ Deduplication: Each package appears only once
+ * - ✅ Smart updates: Only fills missing/null/zero fields
+ * - ✅ Preserves existing good data
+ * - ✅ Atomic CSV rewrite (no corruption)
+ * - ✅ Sorted alphabetically
+ * - ✅ Sequential renumbering
  * 
- * FEATURES:
- * - Rate-limited API calls (10 req/sec)
- * - Atomic CSV writes (tmp + rename)
- * - Checkpoint-based resume
- * - Progress tracking with ETA
- * - Error handling and retries
- * - Sequence tracking for future updates
+ * HOW IT WORKS:
+ * 1. Load ALL packages from CSV into memory (Map<name, data>)
+ * 2. Identify packages needing enrichment
+ * 3. Fetch metadata and smartly merge with existing data
+ * 4. Write deduplicated, sorted CSV atomically
+ * 
+ * SMART UPDATE LOGIC:
+ * - Only update if current value is: null, undefined, '', '0', 'N/A', or 0
+ * - Preserve existing good values
+ * - Merge new data intelligently
  */
 
 const fs = require('fs');
@@ -30,29 +35,24 @@ const readline = require('readline');
 // ============================================================================
 
 const CONFIG = {
-  // Registry
   registry: process.env.NPM_REGISTRY || 'https://registry.npmmirror.com',
   
-  // Files (same directory)
   inputCsv: path.join(__dirname, 'npm.csv'),
-  outputCsv: path.join(__dirname, 'npm.csv'), // Same file (upsert)
+  outputCsv: path.join(__dirname, 'npm.csv'),
   checkpointFile: path.join(__dirname, 'enrich-checkpoint.json'),
   
-  // Performance
   workers: parseInt(process.env.ENRICH_WORKERS) || 10,
   timeout: 120000,
   maxRetries: 3,
+  rateLimit: 10, // req/sec
   
-  // Rate limiting
-  rateLimit: 10, // requests per second
-  
-  userAgent: 'npm-enricher/1.0.0 (Zeeeepa; +https://github.com/zeeeepa/npm)',
+  userAgent: 'npm-enricher/2.0.0-deduplicated (Zeeeepa)',
 };
 
 const logger = console;
 
 // ============================================================================
-// Rate Limiter (Token Bucket)
+// Rate Limiter
 // ============================================================================
 
 class RateLimiter {
@@ -64,7 +64,6 @@ class RateLimiter {
 
   async waitForToken() {
     while (this.tokens < 1) {
-      // Refill tokens
       const now = Date.now();
       const elapsed = (now - this.lastRefill) / 1000;
       this.tokens = Math.min(this.maxPerSecond, this.tokens + elapsed * this.maxPerSecond);
@@ -74,12 +73,108 @@ class RateLimiter {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
-
     this.tokens -= 1;
   }
 }
 
 const rateLimiter = new RateLimiter(CONFIG.rateLimit);
+
+// ============================================================================
+// Package Registry - Deduplication Core
+// ============================================================================
+
+class PackageRegistry {
+  constructor() {
+    this.packages = new Map(); // Map<packageName, packageData>
+  }
+
+  /**
+   * Add or update package (deduplication + smart merge)
+   */
+  addOrUpdate(name, data) {
+    if (this.packages.has(name)) {
+      const existing = this.packages.get(name);
+      const merged = this.smartMerge(existing, data);
+      this.packages.set(name, merged);
+    } else {
+      this.packages.set(name, {
+        name,
+        ...data,
+      });
+    }
+  }
+
+  /**
+   * Smart merge: Only update fields that are empty/missing
+   */
+  smartMerge(existing, newData) {
+    const merged = { ...existing };
+
+    // Helper: Check if value needs update
+    const needsUpdate = (val) => {
+      return val === null || 
+             val === undefined || 
+             val === '' || 
+             val === '0' || 
+             val === 'N/A' || 
+             val === 0 ||
+             val === 'unknown';
+    };
+
+    // Update each field intelligently
+    for (const key of Object.keys(newData)) {
+      if (needsUpdate(merged[key]) && !needsUpdate(newData[key])) {
+        merged[key] = newData[key];
+      }
+    }
+
+    return merged;
+  }
+
+  has(name) {
+    return this.packages.has(name);
+  }
+
+  get(name) {
+    return this.packages.get(name);
+  }
+
+  /**
+   * Get all packages sorted alphabetically
+   */
+  getAllSorted() {
+    const packages = Array.from(this.packages.values());
+    packages.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    return packages;
+  }
+
+  size() {
+    return this.packages.size;
+  }
+
+  /**
+   * Get packages needing enrichment
+   */
+  getNeedingEnrichment() {
+    const needEnrichment = [];
+    
+    for (const pkg of this.packages.values()) {
+      const needsIt = (
+        !pkg.file_number || pkg.file_number === '0' || pkg.file_number === 'N/A'
+      ) || (
+        !pkg.unpacked_size || pkg.unpacked_size === '0' || pkg.unpacked_size === 'N/A'
+      ) || (
+        !pkg.description || pkg.description === ''
+      );
+
+      if (needsIt) {
+        needEnrichment.push(pkg);
+      }
+    }
+
+    return needEnrichment;
+  }
+}
 
 // ============================================================================
 // Utilities
@@ -109,7 +204,7 @@ async function fetchWithRetry(url, options = {}) {
       }
 
       if (result.status === 404) {
-        return null; // Package not found
+        return null;
       }
 
       throw new Error(`HTTP ${result.status}`);
@@ -141,7 +236,191 @@ function escapeCSV(value) {
 }
 
 // ============================================================================
-// Checkpoint Management
+// CSV Loading
+// ============================================================================
+
+async function loadCSVIntoRegistry(csvPath, registry) {
+  if (!fs.existsSync(csvPath)) {
+    logger.log('[CSV] File not found: %s', csvPath);
+    return 0;
+  }
+
+  const fileStream = fs.createReadStream(csvPath);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity,
+  });
+
+  let isHeader = true;
+  let lineNumber = 0;
+  let loadedCount = 0;
+
+  for await (const line of rl) {
+    lineNumber++;
+    
+    if (isHeader) {
+      isHeader = false;
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Parse CSV (simple parser)
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < trimmed.length; i++) {
+      const char = trimmed[i];
+
+      if (char === '"') {
+        if (inQuotes && trimmed[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === ',' && !inQuotes) {
+        values.push(current);
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    values.push(current);
+
+    if (values.length >= 3) {
+      const packageData = {
+        number: parseInt(values[0]) || lineNumber,
+        npm_url: values[1],
+        name: values[2],
+        file_number: values[3] || '0',
+        unpacked_size: values[4] || '0',
+        dependencies: values[5] || '0',
+        dependents: values[6] || '0',
+        latest_release_published_at: values[7] || '',
+        description: values[8] || '',
+        keywords: values[9] || '',
+      };
+
+      registry.addOrUpdate(packageData.name, packageData);
+      loadedCount++;
+    }
+  }
+
+  logger.log('[CSV] Loaded %d packages into registry', loadedCount);
+  logger.log('[CSV] Unique packages after deduplication: %d', registry.size());
+  
+  return loadedCount;
+}
+
+// ============================================================================
+// Enrichment
+// ============================================================================
+
+async function enrichPackage(pkg, registry) {
+  try {
+    const url = `${CONFIG.registry}/${encodeURIComponent(pkg.name)}`;
+    const data = await fetchWithRetry(url);
+
+    if (!data) {
+      return pkg; // Package not found
+    }
+
+    const distTags = data['dist-tags'] || {};
+    const latestVersion = distTags.latest || Object.keys(data.versions || {})[0];
+    
+    if (!latestVersion) {
+      return pkg;
+    }
+
+    const versionData = data.versions[latestVersion] || {};
+    const dist = versionData.dist || {};
+    const time = data.time || {};
+
+    const newData = {
+      file_number: dist.fileCount || pkg.file_number || '0',
+      unpacked_size: dist.unpackedSize || pkg.unpacked_size || '0',
+      dependencies: Object.keys(versionData.dependencies || {}).length || pkg.dependencies || '0',
+      latest_release_published_at: time[latestVersion] || time.modified || pkg.latest_release_published_at || '',
+      description: (versionData.description || pkg.description || '').replace(/[\r\n]+/g, ' ').substring(0, 500),
+      keywords: Array.isArray(versionData.keywords) 
+        ? versionData.keywords.join(', ').substring(0, 500)
+        : (pkg.keywords || ''),
+    };
+
+    // Smart merge into registry
+    registry.addOrUpdate(pkg.name, newData);
+
+    return registry.get(pkg.name);
+  } catch (err) {
+    logger.error('[ENRICH] Error enriching %s: %s', pkg.name, err.message);
+    return pkg;
+  }
+}
+
+async function enrichBatch(packages, registry) {
+  const promises = packages.map(pkg => enrichPackage(pkg, registry));
+  return await Promise.all(promises);
+}
+
+// ============================================================================
+// CSV Writing
+// ============================================================================
+
+async function writeCSV(registry, csvPath) {
+  const tmpFile = csvPath + '.tmp';
+  const stream = fs.createWriteStream(tmpFile);
+
+  // Write header
+  stream.write('number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n');
+
+  // Get all packages sorted
+  const packages = registry.getAllSorted();
+
+  // Write packages with sequential numbering
+  for (let i = 0; i < packages.length; i++) {
+    const pkg = packages[i];
+    const rowNum = i + 1;
+
+    const row = [
+      rowNum,
+      escapeCSV(pkg.npm_url || `https://www.npmjs.com/package/${encodeURIComponent(pkg.name)}`),
+      escapeCSV(pkg.name),
+      escapeCSV(pkg.file_number),
+      escapeCSV(pkg.unpacked_size),
+      escapeCSV(pkg.dependencies),
+      escapeCSV(pkg.dependents || '0'),
+      escapeCSV(pkg.latest_release_published_at),
+      escapeCSV(pkg.description),
+      escapeCSV(pkg.keywords),
+    ].join(',');
+
+    stream.write(row + '\n');
+  }
+
+  // Close and rename atomically
+  await new Promise((resolve, reject) => {
+    stream.end(() => {
+      try {
+        // Backup original
+        if (fs.existsSync(csvPath)) {
+          fs.copyFileSync(csvPath, csvPath + '.backup');
+        }
+        
+        // Atomic rename
+        fs.renameSync(tmpFile, csvPath);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+// ============================================================================
+// Checkpoint
 // ============================================================================
 
 function loadCheckpoint() {
@@ -157,7 +436,6 @@ function loadCheckpoint() {
   
   return {
     enrichedCount: 0,
-    lastProcessedNumber: 0,
     startTime: Date.now(),
     errors: [],
   };
@@ -174,249 +452,65 @@ function saveCheckpoint(checkpoint) {
 }
 
 // ============================================================================
-// CSV Reading & Parsing
-// ============================================================================
-
-async function readCSV() {
-  const packages = [];
-  
-  if (!fs.existsSync(CONFIG.inputCsv)) {
-    throw new Error(`CSV not found: ${CONFIG.inputCsv}`);
-  }
-
-  const fileStream = fs.createReadStream(CONFIG.inputCsv);
-  const rl = readline.createInterface({
-    input: fileStream,
-    crlfDelay: Infinity,
-  });
-
-  let isHeader = true;
-  let lineNumber = 0;
-
-  for await (const line of rl) {
-    lineNumber++;
-    
-    if (isHeader) {
-      isHeader = false;
-      continue;
-    }
-
-    // Parse CSV line (simple parser - handles basic cases)
-    const values = [];
-    let current = '';
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i];
-
-      if (char === '"') {
-        if (inQuotes && line[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuotes = !inQuotes;
-        }
-      } else if (char === ',' && !inQuotes) {
-        values.push(current);
-        current = '';
-      } else {
-        current += char;
-      }
-    }
-    values.push(current);
-
-    if (values.length >= 3) {
-      packages.push({
-        number: parseInt(values[0]) || lineNumber,
-        npm_url: values[1],
-        package_name: values[2],
-        file_number: values[3] || '0',
-        unpacked_size: values[4] || '0',
-        dependencies: values[5] || '0',
-        dependents: values[6] || '0',
-        latest_release_published_at: values[7] || '',
-        description: values[8] || '',
-        keywords: values[9] || '',
-      });
-    }
-  }
-
-  logger.log('[CSV] Loaded %d packages from %s', packages.length, CONFIG.inputCsv);
-  return packages;
-}
-
-// ============================================================================
-// Package Enrichment
-// ============================================================================
-
-async function enrichPackage(pkg) {
-  try {
-    // Skip if already enriched (has file_number > 0 or unpacked_size > 0)
-    if ((pkg.file_number && pkg.file_number !== '0' && pkg.file_number !== 'N/A') ||
-        (pkg.unpacked_size && pkg.unpacked_size !== '0' && pkg.unpacked_size !== 'N/A')) {
-      return pkg; // Already enriched
-    }
-
-    const url = `${CONFIG.registry}/${encodeURIComponent(pkg.package_name)}`;
-    const data = await fetchWithRetry(url);
-
-    if (!data) {
-      // Package not found or error
-      return {
-        ...pkg,
-        file_number: 'N/A',
-        unpacked_size: 'N/A',
-        dependencies: '0',
-        dependents: '0',
-        latest_release_published_at: '',
-        description: '',
-        keywords: '',
-      };
-    }
-
-    // Extract latest version
-    const distTags = data['dist-tags'] || {};
-    const latestVersion = distTags.latest || Object.keys(data.versions || {})[0];
-    
-    if (!latestVersion) {
-      return {
-        ...pkg,
-        file_number: 'N/A',
-        unpacked_size: 'N/A',
-        dependencies: '0',
-        dependents: '0',
-      };
-    }
-
-    const versionData = data.versions[latestVersion] || {};
-    const dist = versionData.dist || {};
-    const time = data.time || {};
-
-    // Extract metadata
-    const fileCount = dist.fileCount || 0;
-    const unpackedSize = dist.unpackedSize || 0;
-    const dependencies = Object.keys(versionData.dependencies || {}).length;
-    const publishTime = time[latestVersion] || time.modified || '';
-    const description = (versionData.description || '').replace(/[\r\n]+/g, ' ').substring(0, 500);
-    const keywords = Array.isArray(versionData.keywords) 
-      ? versionData.keywords.join(', ').substring(0, 500)
-      : '';
-
-    return {
-      ...pkg,
-      file_number: String(fileCount),
-      unpacked_size: String(unpackedSize),
-      dependencies: String(dependencies),
-      dependents: '0', // Would require separate API call
-      latest_release_published_at: publishTime,
-      description: description,
-      keywords: keywords,
-    };
-  } catch (err) {
-    logger.error('[ENRICH] Error enriching %s: %s', pkg.package_name, err.message);
-    return pkg; // Return original on error
-  }
-}
-
-// ============================================================================
-// Batch Processing
-// ============================================================================
-
-async function enrichBatch(packages, startIdx, endIdx) {
-  const batch = packages.slice(startIdx, endIdx);
-  const promises = batch.map(pkg => enrichPackage(pkg));
-  return await Promise.all(promises);
-}
-
-// ============================================================================
-// CSV Writing
-// ============================================================================
-
-async function writeCSV(packages) {
-  const tmpFile = CONFIG.outputCsv + '.tmp';
-  const stream = fs.createWriteStream(tmpFile);
-
-  // Write header
-  stream.write('number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n');
-
-  // Write packages
-  for (const pkg of packages) {
-    const row = [
-      pkg.number,
-      escapeCSV(pkg.npm_url),
-      escapeCSV(pkg.package_name),
-      escapeCSV(pkg.file_number),
-      escapeCSV(pkg.unpacked_size),
-      escapeCSV(pkg.dependencies),
-      escapeCSV(pkg.dependents),
-      escapeCSV(pkg.latest_release_published_at),
-      escapeCSV(pkg.description),
-      escapeCSV(pkg.keywords),
-    ].join(',');
-
-    stream.write(row + '\n');
-  }
-
-  // Close and rename atomically
-  await new Promise((resolve, reject) => {
-    stream.end(() => {
-      try {
-        fs.renameSync(tmpFile, CONFIG.outputCsv);
-        resolve();
-      } catch (err) {
-        reject(err);
-      }
-    });
-  });
-}
-
-// ============================================================================
-// Main Enrichment Function
+// Main
 // ============================================================================
 
 async function main() {
   const startTime = Date.now();
   
   logger.log('═══════════════════════════════════════════════════════');
-  logger.log('NPM Package Enricher');
+  logger.log('NPM Package Enricher v2.0 - DEDUPLICATED & SMART UPDATES');
   logger.log('═══════════════════════════════════════════════════════');
   logger.log('Config:');
   logger.log('  Workers: %d', CONFIG.workers);
   logger.log('  Rate limit: %d req/sec', CONFIG.rateLimit);
-  logger.log('  Input: %s', CONFIG.inputCsv);
-  logger.log('  Output: %s (upsert)', CONFIG.outputCsv);
+  logger.log('  Input/Output: %s', CONFIG.inputCsv);
   logger.log('═══════════════════════════════════════════════════════');
 
   try {
     // Load checkpoint
     const checkpoint = loadCheckpoint();
     
-    // Read CSV
-    logger.log('[STEP 1/3] Reading CSV...');
-    const packages = await readCSV();
+    // Create registry
+    const registry = new PackageRegistry();
     
-    // Filter packages that need enrichment
-    const needsEnrichment = packages.filter(pkg => {
-      const needsIt = (pkg.file_number === '0' || pkg.file_number === 'N/A' || !pkg.file_number) &&
-                      (pkg.unpacked_size === '0' || pkg.unpacked_size === 'N/A' || !pkg.unpacked_size);
-      return needsIt && pkg.number > checkpoint.lastProcessedNumber;
-    });
-
-    logger.log('[ENRICH] Total packages: %d', packages.length);
-    logger.log('[ENRICH] Already enriched: %d', packages.length - needsEnrichment.length);
+    // Load existing CSV into registry (deduplication happens here)
+    logger.log('[STEP 1/3] LOADING CSV INTO REGISTRY...');
+    const loadedCount = await loadCSVIntoRegistry(CONFIG.inputCsv, registry);
+    
+    logger.log('[REGISTRY] Total unique packages: %d', registry.size());
+    
+    // Identify packages needing enrichment
+    logger.log('[STEP 2/3] IDENTIFYING PACKAGES NEEDING ENRICHMENT...');
+    const needsEnrichment = registry.getNeedingEnrichment();
+    
+    logger.log('[ENRICH] Total packages: %d', registry.size());
+    logger.log('[ENRICH] Already enriched: %d', registry.size() - needsEnrichment.length);
     logger.log('[ENRICH] Need enrichment: %d', needsEnrichment.length);
 
     if (needsEnrichment.length === 0) {
-      logger.log('[ENRICH] All packages already enriched!');
+      logger.log('[ENRICH] ✓ All packages already enriched!');
+      
+      // Still write CSV to ensure deduplication
+      logger.log('[STEP 3/3] WRITING DEDUPLICATED CSV...');
+      await writeCSV(registry, CONFIG.outputCsv);
+      
+      logger.log('═══════════════════════════════════════════════════════');
+      logger.log('✓✓✓ COMPLETE (DEDUPLICATION ONLY) ✓✓✓');
+      logger.log('═══════════════════════════════════════════════════════');
+      logger.log('Total packages: %d', registry.size());
+      logger.log('Duplicates removed: %d', loadedCount - registry.size());
+      logger.log('═══════════════════════════════════════════════════════');
+      
       return {
         success: true,
         enriched: 0,
-        total: packages.length,
-        duration: 0,
+        total: registry.size(),
+        duplicatesRemoved: loadedCount - registry.size(),
       };
     }
 
-    // Process in batches
+    // Enrich in batches
     logger.log('═══════════════════════════════════════════════════════');
     logger.log('[STEP 2/3] ENRICHING (%d packages)', needsEnrichment.length);
     logger.log('═══════════════════════════════════════════════════════');
@@ -426,24 +520,10 @@ async function main() {
 
     for (let i = 0; i < totalToEnrich; i += CONFIG.workers) {
       const endIdx = Math.min(i + CONFIG.workers, totalToEnrich);
-      const enrichedBatch = await enrichBatch(needsEnrichment, i, endIdx);
-
-      // Update packages array with enriched data
-      for (const enrichedPkg of enrichedBatch) {
-        const idx = packages.findIndex(p => p.number === enrichedPkg.number);
-        if (idx !== -1) {
-          packages[idx] = enrichedPkg;
-        }
-      }
-
-      enrichedCount += enrichedBatch.length;
-      checkpoint.enrichedCount = enrichedCount;
-      checkpoint.lastProcessedNumber = enrichedBatch[enrichedBatch.length - 1].number;
-
-      // Save checkpoint every 1000 packages
-      if (enrichedCount % 1000 === 0) {
-        saveCheckpoint(checkpoint);
-      }
+      const batch = needsEnrichment.slice(i, endIdx);
+      
+      await enrichBatch(batch, registry);
+      enrichedCount += batch.length;
 
       // Progress logging
       if (enrichedCount % 100 === 0 || enrichedCount === totalToEnrich) {
@@ -455,22 +535,23 @@ async function main() {
         logger.log('[ENRICH] %s%% | %d/%d | %s min | %d pkg/min | ETA: %d min',
           progress, enrichedCount, totalToEnrich, elapsed, rate, remaining);
       }
+
+      // Save checkpoint every 1000
+      if (enrichedCount % 1000 === 0) {
+        checkpoint.enrichedCount = enrichedCount;
+        saveCheckpoint(checkpoint);
+      }
     }
 
-    // Write enriched CSV
+    // Write deduplicated CSV
     logger.log('═══════════════════════════════════════════════════════');
-    logger.log('[STEP 3/3] WRITING CSV');
+    logger.log('[STEP 3/3] WRITING DEDUPLICATED CSV');
     logger.log('═══════════════════════════════════════════════════════');
     
-    await writeCSV(packages);
+    await writeCSV(registry, CONFIG.outputCsv);
     
     logger.log('[CSV] Written to: %s', CONFIG.outputCsv);
-    logger.log('[CSV] Total rows: %d', packages.length);
-
-    // Final checkpoint
-    checkpoint.endTime = Date.now();
-    checkpoint.duration = ((checkpoint.endTime - startTime) / 1000 / 60).toFixed(2);
-    saveCheckpoint(checkpoint);
+    logger.log('[CSV] Total rows: %d', registry.size());
 
     const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
 
@@ -479,14 +560,16 @@ async function main() {
     logger.log('═══════════════════════════════════════════════════════');
     logger.log('Duration: %s minutes', duration);
     logger.log('Enriched: %d packages', enrichedCount);
-    logger.log('Total: %d packages', packages.length);
+    logger.log('Total unique: %d packages', registry.size());
+    logger.log('Duplicates removed: %d', loadedCount - registry.size());
     logger.log('Throughput: %d pkg/min', Math.round(enrichedCount / parseFloat(duration)));
     logger.log('═══════════════════════════════════════════════════════');
 
     return {
       success: true,
       enriched: enrichedCount,
-      total: packages.length,
+      total: registry.size(),
+      duplicatesRemoved: loadedCount - registry.size(),
       duration: parseFloat(duration),
     };
 
