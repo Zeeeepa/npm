@@ -1,328 +1,520 @@
 'use strict';
 
 /**
- * NPM Registry Enricher - Fetch Package Metadata
+ * NPM Package Enricher - Production Edition
  * Author: Zeeeepa
+ * Date: 2025-11-13
  * 
  * PURPOSE:
- * - Fetch full metadata for all packages from registry
- * - Extract: description, keywords, dependencies, file counts, unpacked size
- * - Store in additional database tables for CSV export
- * - Process in batches for memory efficiency
+ * - Reads npm.csv from same directory
+ * - Enriches missing metadata for each package
+ * - Upserts back to npm.csv atomically
+ * - Maintains checkpoint with sequence for incremental updates
  * 
- * USAGE:
- *   DB_URL=postgres://user:pass@localhost/cnpm node scripts/indexer/enrich.js
+ * FEATURES:
+ * - Rate-limited API calls (10 req/sec)
+ * - Atomic CSV writes (tmp + rename)
+ * - Checkpoint-based resume
+ * - Progress tracking with ETA
+ * - Error handling and retries
+ * - Sequence tracking for future updates
  */
 
-const { Client } = require('pg');
+const fs = require('fs');
+const path = require('path');
+const urllib = require('urllib');
+const readline = require('readline');
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 const CONFIG = {
-  dbUrl: process.env.DB_URL || 'postgres://localhost/cnpm',
+  // Registry
   registry: process.env.NPM_REGISTRY || 'https://registry.npmmirror.com',
-  batchSize: parseInt(process.env.ENRICH_BATCH_SIZE) || 100,
-  concurrency: parseInt(process.env.ENRICH_CONCURRENCY) || 10,
-  timeout: 30000,
+  
+  // Files (same directory)
+  inputCsv: path.join(__dirname, 'npm.csv'),
+  outputCsv: path.join(__dirname, 'npm.csv'), // Same file (upsert)
+  checkpointFile: path.join(__dirname, 'enrich-checkpoint.json'),
+  
+  // Performance
+  workers: parseInt(process.env.ENRICH_WORKERS) || 10,
+  timeout: 120000,
   maxRetries: 3,
-  requestDelay: 50, // Delay between requests to avoid rate limiting
+  
+  // Rate limiting
+  rateLimit: 10, // requests per second
+  
+  userAgent: 'npm-enricher/1.0.0 (Zeeeepa; +https://github.com/zeeeepa/npm)',
 };
 
+const logger = console;
+
 // ============================================================================
-// Enrichment Schema (Simplified - stores computed metadata)
+// Rate Limiter (Token Bucket)
 // ============================================================================
 
-const ENRICH_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS package_enrichment (
-    id BIGSERIAL PRIMARY KEY,
-    gmt_create timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    gmt_modified timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    package_id varchar(24) NOT NULL,
-    description text DEFAULT NULL,
-    keywords text DEFAULT NULL,
-    latest_version varchar(256) DEFAULT NULL,
-    publish_time timestamp(3) DEFAULT NULL,
-    dependencies_count integer DEFAULT 0,
-    file_count integer DEFAULT 0,
-    unpacked_size bigint DEFAULT 0,
-    CONSTRAINT package_enrichment_uk_package_id UNIQUE (package_id)
-  )
-`;
+class RateLimiter {
+  constructor(maxPerSecond) {
+    this.maxPerSecond = maxPerSecond;
+    this.tokens = maxPerSecond;
+    this.lastRefill = Date.now();
+  }
 
-async function ensureEnrichmentSchema(client) {
-  console.log('[%s] [SCHEMA] Ensuring enrichment schema exists...', new Date().toISOString());
-  await client.query(ENRICH_SCHEMA);
-  console.log('[%s] [SCHEMA] ✓ Enrichment table ready', new Date().toISOString());
+  async waitForToken() {
+    while (this.tokens < 1) {
+      // Refill tokens
+      const now = Date.now();
+      const elapsed = (now - this.lastRefill) / 1000;
+      this.tokens = Math.min(this.maxPerSecond, this.tokens + elapsed * this.maxPerSecond);
+      this.lastRefill = now;
+
+      if (this.tokens < 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    this.tokens -= 1;
+  }
 }
 
+const rateLimiter = new RateLimiter(CONFIG.rateLimit);
+
 // ============================================================================
-// Registry API Fetcher
+// Utilities
 // ============================================================================
 
-async function fetchPackageMetadata(packageName) {
-  const url = `${CONFIG.registry}/${encodeURIComponent(packageName)}`;
+async function fetchWithRetry(url, options = {}) {
+  let lastError;
   
   for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
     try {
-      const response = await fetch(url, {
+      await rateLimiter.waitForToken();
+      
+      const result = await urllib.request(url, {
+        dataType: 'json',
+        timeout: CONFIG.timeout,
         headers: {
-          'user-agent': 'npm-enricher/1.0.0',
+          'user-agent': CONFIG.userAgent,
           'accept': 'application/json',
         },
-        signal: AbortSignal.timeout(CONFIG.timeout),
+        gzip: true,
+        followRedirect: true,
+        ...options,
       });
-      
-      if (response.status === 404) {
+
+      if (result.status === 200) {
+        return result.data;
+      }
+
+      if (result.status === 404) {
         return null; // Package not found
       }
-      
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      
-      return await response.json();
+
+      throw new Error(`HTTP ${result.status}`);
     } catch (err) {
+      lastError = err;
+      
       if (attempt < CONFIG.maxRetries) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
         await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        console.error('[%s] [FETCH] Failed to fetch %s after %d attempts: %s',
-          new Date().toISOString(), packageName, CONFIG.maxRetries, err.message);
-        return null;
       }
     }
   }
+
+  throw lastError;
+}
+
+function escapeCSV(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  
+  const str = String(value);
+  
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  
+  return str;
 }
 
 // ============================================================================
-// Extract Metadata from Package Document
+// Checkpoint Management
 // ============================================================================
 
-function extractEnrichmentData(pkgData) {
-  if (!pkgData) return null;
-  
-  // Get latest version info
-  const distTags = pkgData['dist-tags'] || {};
-  const latestVersion = distTags.latest || Object.keys(pkgData.versions || {})[0];
-  
-  if (!latestVersion) return null;
-  
-  const versionData = pkgData.versions?.[latestVersion];
-  if (!versionData) return null;
-  
-  // Extract metadata
-  const description = versionData.description || pkgData.description || '';
-  const keywords = versionData.keywords || pkgData.keywords || [];
-  const keywordsStr = Array.isArray(keywords) ? keywords.join(',') : '';
-  
-  // Dependencies count
-  const deps = versionData.dependencies || {};
-  const devDeps = versionData.devDependencies || {};
-  const dependenciesCount = Object.keys(deps).length + Object.keys(devDeps).length;
-  
-  // File info from dist
-  const dist = versionData.dist || {};
-  const unpackedSize = dist.unpackedSize || 0;
-  const fileCount = dist.fileCount || 0;
-  
-  // Publish time
-  const time = pkgData.time || {};
-  const publishTime = time[latestVersion] || time.modified || time.created;
+function loadCheckpoint() {
+  if (fs.existsSync(CONFIG.checkpointFile)) {
+    try {
+      const checkpoint = JSON.parse(fs.readFileSync(CONFIG.checkpointFile, 'utf8'));
+      logger.log('[CHECKPOINT] Loaded: %d packages enriched', checkpoint.enrichedCount);
+      return checkpoint;
+    } catch (err) {
+      logger.error('[CHECKPOINT] Failed to load: %s', err.message);
+    }
+  }
   
   return {
-    description: description.substring(0, 10000), // Truncate if too long
-    keywords: keywordsStr.substring(0, 1000),
-    latestVersion,
-    publishTime: publishTime ? new Date(publishTime) : null,
-    dependenciesCount,
-    fileCount,
-    unpackedSize,
+    enrichedCount: 0,
+    lastProcessedNumber: 0,
+    startTime: Date.now(),
+    errors: [],
   };
 }
 
+function saveCheckpoint(checkpoint) {
+  try {
+    const tmpFile = CONFIG.checkpointFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(checkpoint, null, 2), 'utf8');
+    fs.renameSync(tmpFile, CONFIG.checkpointFile);
+  } catch (err) {
+    logger.error('[CHECKPOINT] Failed to save: %s', err.message);
+  }
+}
+
 // ============================================================================
-// Batch Enrichment Processor
+// CSV Reading & Parsing
 // ============================================================================
 
-async function enrichBatch(client, packages) {
-  const enriched = [];
+async function readCSV() {
+  const packages = [];
   
-  // Fetch metadata with concurrency control
-  const promises = [];
-  for (let i = 0; i < packages.length; i += CONFIG.concurrency) {
-    const batch = packages.slice(i, i + CONFIG.concurrency);
+  if (!fs.existsSync(CONFIG.inputCsv)) {
+    throw new Error(`CSV not found: ${CONFIG.inputCsv}`);
+  }
+
+  const fileStream = fs.createReadStream(CONFIG.inputCsv);
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity,
+  });
+
+  let isHeader = true;
+  let lineNumber = 0;
+
+  for await (const line of rl) {
+    lineNumber++;
     
-    const batchPromises = batch.map(async (pkg) => {
-      const metadata = await fetchPackageMetadata(pkg.name);
-      const enrichment = extractEnrichmentData(metadata);
-      
-      if (enrichment) {
-        return {
-          package_id: pkg.package_id,
-          ...enrichment,
-        };
+    if (isHeader) {
+      isHeader = false;
+      continue;
+    }
+
+    // Parse CSV line (simple parser - handles basic cases)
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+
+      if (char === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === ',' && !inQuotes) {
+        values.push(current);
+        current = '';
+      } else {
+        current += char;
       }
-      return null;
-    });
-    
-    const results = await Promise.all(batchPromises);
-    enriched.push(...results.filter(r => r !== null));
-    
-    // Add delay between concurrent batches
-    if (i + CONFIG.concurrency < packages.length && CONFIG.requestDelay > 0) {
-      await new Promise(resolve => setTimeout(resolve, CONFIG.requestDelay));
+    }
+    values.push(current);
+
+    if (values.length >= 3) {
+      packages.push({
+        number: parseInt(values[0]) || lineNumber,
+        npm_url: values[1],
+        package_name: values[2],
+        file_number: values[3] || '0',
+        unpacked_size: values[4] || '0',
+        dependencies: values[5] || '0',
+        dependents: values[6] || '0',
+        latest_release_published_at: values[7] || '',
+        description: values[8] || '',
+        keywords: values[9] || '',
+      });
     }
   }
-  
-  if (enriched.length === 0) {
-    return 0;
+
+  logger.log('[CSV] Loaded %d packages from %s', packages.length, CONFIG.inputCsv);
+  return packages;
+}
+
+// ============================================================================
+// Package Enrichment
+// ============================================================================
+
+async function enrichPackage(pkg) {
+  try {
+    // Skip if already enriched (has file_number > 0 or unpacked_size > 0)
+    if ((pkg.file_number && pkg.file_number !== '0' && pkg.file_number !== 'N/A') ||
+        (pkg.unpacked_size && pkg.unpacked_size !== '0' && pkg.unpacked_size !== 'N/A')) {
+      return pkg; // Already enriched
+    }
+
+    const url = `${CONFIG.registry}/${encodeURIComponent(pkg.package_name)}`;
+    const data = await fetchWithRetry(url);
+
+    if (!data) {
+      // Package not found or error
+      return {
+        ...pkg,
+        file_number: 'N/A',
+        unpacked_size: 'N/A',
+        dependencies: '0',
+        dependents: '0',
+        latest_release_published_at: '',
+        description: '',
+        keywords: '',
+      };
+    }
+
+    // Extract latest version
+    const distTags = data['dist-tags'] || {};
+    const latestVersion = distTags.latest || Object.keys(data.versions || {})[0];
+    
+    if (!latestVersion) {
+      return {
+        ...pkg,
+        file_number: 'N/A',
+        unpacked_size: 'N/A',
+        dependencies: '0',
+        dependents: '0',
+      };
+    }
+
+    const versionData = data.versions[latestVersion] || {};
+    const dist = versionData.dist || {};
+    const time = data.time || {};
+
+    // Extract metadata
+    const fileCount = dist.fileCount || 0;
+    const unpackedSize = dist.unpackedSize || 0;
+    const dependencies = Object.keys(versionData.dependencies || {}).length;
+    const publishTime = time[latestVersion] || time.modified || '';
+    const description = (versionData.description || '').replace(/[\r\n]+/g, ' ').substring(0, 500);
+    const keywords = Array.isArray(versionData.keywords) 
+      ? versionData.keywords.join(', ').substring(0, 500)
+      : '';
+
+    return {
+      ...pkg,
+      file_number: String(fileCount),
+      unpacked_size: String(unpackedSize),
+      dependencies: String(dependencies),
+      dependents: '0', // Would require separate API call
+      latest_release_published_at: publishTime,
+      description: description,
+      keywords: keywords,
+    };
+  } catch (err) {
+    logger.error('[ENRICH] Error enriching %s: %s', pkg.package_name, err.message);
+    return pkg; // Return original on error
   }
-  
-  // Insert into database
-  const values = [];
-  const placeholders = [];
-  let paramIndex = 1;
-  
-  for (const data of enriched) {
-    placeholders.push(
-      `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7})`
-    );
-    values.push(
-      data.package_id,
-      data.description,
-      data.keywords,
-      data.latestVersion,
-      data.publishTime,
-      data.dependenciesCount,
-      data.fileCount,
-      data.unpackedSize
-    );
-    paramIndex += 8;
+}
+
+// ============================================================================
+// Batch Processing
+// ============================================================================
+
+async function enrichBatch(packages, startIdx, endIdx) {
+  const batch = packages.slice(startIdx, endIdx);
+  const promises = batch.map(pkg => enrichPackage(pkg));
+  return await Promise.all(promises);
+}
+
+// ============================================================================
+// CSV Writing
+// ============================================================================
+
+async function writeCSV(packages) {
+  const tmpFile = CONFIG.outputCsv + '.tmp';
+  const stream = fs.createWriteStream(tmpFile);
+
+  // Write header
+  stream.write('number,npm_url,package_name,file_number,unpacked_size,dependencies,dependents,latest_release_published_at,description,keywords\n');
+
+  // Write packages
+  for (const pkg of packages) {
+    const row = [
+      pkg.number,
+      escapeCSV(pkg.npm_url),
+      escapeCSV(pkg.package_name),
+      escapeCSV(pkg.file_number),
+      escapeCSV(pkg.unpacked_size),
+      escapeCSV(pkg.dependencies),
+      escapeCSV(pkg.dependents),
+      escapeCSV(pkg.latest_release_published_at),
+      escapeCSV(pkg.description),
+      escapeCSV(pkg.keywords),
+    ].join(',');
+
+    stream.write(row + '\n');
   }
-  
-  const sql = `
-    INSERT INTO package_enrichment (
-      package_id, description, keywords, latest_version, publish_time,
-      dependencies_count, file_count, unpacked_size
-    )
-    VALUES ${placeholders.join(', ')}
-    ON CONFLICT (package_id) DO UPDATE SET
-      description = EXCLUDED.description,
-      keywords = EXCLUDED.keywords,
-      latest_version = EXCLUDED.latest_version,
-      publish_time = EXCLUDED.publish_time,
-      dependencies_count = EXCLUDED.dependencies_count,
-      file_count = EXCLUDED.file_count,
-      unpacked_size = EXCLUDED.unpacked_size,
-      gmt_modified = CURRENT_TIMESTAMP
-  `;
-  
-  await client.query(sql, values);
-  
-  return enriched.length;
+
+  // Close and rename atomically
+  await new Promise((resolve, reject) => {
+    stream.end(() => {
+      try {
+        fs.renameSync(tmpFile, CONFIG.outputCsv);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
 }
 
 // ============================================================================
 // Main Enrichment Function
 // ============================================================================
 
-async function enrich() {
+async function main() {
   const startTime = Date.now();
   
-  console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-  console.log('[%s] NPM Registry Enricher - Fetch Metadata', new Date().toISOString());
-  console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-  console.log('[%s] Configuration:', new Date().toISOString());
-  console.log('[%s]   Database: %s', new Date().toISOString(), CONFIG.dbUrl);
-  console.log('[%s]   Registry: %s', new Date().toISOString(), CONFIG.registry);
-  console.log('[%s]   Batch size: %d', new Date().toISOString(), CONFIG.batchSize);
-  console.log('[%s]   Concurrency: %d', new Date().toISOString(), CONFIG.concurrency);
-  console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-  
-  const client = new Client({ connectionString: CONFIG.dbUrl });
-  
+  logger.log('═══════════════════════════════════════════════════════');
+  logger.log('NPM Package Enricher');
+  logger.log('═══════════════════════════════════════════════════════');
+  logger.log('Config:');
+  logger.log('  Workers: %d', CONFIG.workers);
+  logger.log('  Rate limit: %d req/sec', CONFIG.rateLimit);
+  logger.log('  Input: %s', CONFIG.inputCsv);
+  logger.log('  Output: %s (upsert)', CONFIG.outputCsv);
+  logger.log('═══════════════════════════════════════════════════════');
+
   try {
-    await client.connect();
-    console.log('[%s] [DB] ✓ Connected to database', new Date().toISOString());
+    // Load checkpoint
+    const checkpoint = loadCheckpoint();
     
-    // Ensure enrichment schema
-    await ensureEnrichmentSchema(client);
+    // Read CSV
+    logger.log('[STEP 1/3] Reading CSV...');
+    const packages = await readCSV();
     
-    // Get total package count
-    const countResult = await client.query('SELECT COUNT(*) as count FROM packages');
-    const totalCount = parseInt(countResult.rows[0].count, 10);
-    
-    console.log('[%s] [ENRICH] Total packages to enrich: %s', 
-      new Date().toISOString(), totalCount.toLocaleString());
-    
-    let processed = 0;
-    let offset = 0;
-    
-    while (offset < totalCount) {
-      // Fetch batch of packages
-      const result = await client.query(
-        'SELECT package_id, name FROM packages ORDER BY id LIMIT $1 OFFSET $2',
-        [CONFIG.batchSize, offset]
-      );
-      
-      if (result.rows.length === 0) break;
-      
-      // Enrich this batch
-      const enriched = await enrichBatch(client, result.rows);
-      processed += enriched;
-      offset += result.rows.length;
-      
-      const progress = (offset / totalCount * 100).toFixed(1);
-      const eta = ((Date.now() - startTime) / offset * (totalCount - offset) / 1000 / 60).toFixed(1);
-      
-      console.log('[%s] [ENRICH] Progress: %d/%d (%s%%) | Enriched: %d | ETA: %s min',
-        new Date().toISOString(),
-        offset,
-        totalCount,
-        progress,
-        enriched,
-        eta
-      );
+    // Filter packages that need enrichment
+    const needsEnrichment = packages.filter(pkg => {
+      const needsIt = (pkg.file_number === '0' || pkg.file_number === 'N/A' || !pkg.file_number) &&
+                      (pkg.unpacked_size === '0' || pkg.unpacked_size === 'N/A' || !pkg.unpacked_size);
+      return needsIt && pkg.number > checkpoint.lastProcessedNumber;
+    });
+
+    logger.log('[ENRICH] Total packages: %d', packages.length);
+    logger.log('[ENRICH] Already enriched: %d', packages.length - needsEnrichment.length);
+    logger.log('[ENRICH] Need enrichment: %d', needsEnrichment.length);
+
+    if (needsEnrichment.length === 0) {
+      logger.log('[ENRICH] All packages already enriched!');
+      return {
+        success: true,
+        enriched: 0,
+        total: packages.length,
+        duration: 0,
+      };
     }
+
+    // Process in batches
+    logger.log('═══════════════════════════════════════════════════════');
+    logger.log('[STEP 2/3] ENRICHING (%d packages)', needsEnrichment.length);
+    logger.log('═══════════════════════════════════════════════════════');
+
+    let enrichedCount = 0;
+    const totalToEnrich = needsEnrichment.length;
+
+    for (let i = 0; i < totalToEnrich; i += CONFIG.workers) {
+      const endIdx = Math.min(i + CONFIG.workers, totalToEnrich);
+      const enrichedBatch = await enrichBatch(needsEnrichment, i, endIdx);
+
+      // Update packages array with enriched data
+      for (const enrichedPkg of enrichedBatch) {
+        const idx = packages.findIndex(p => p.number === enrichedPkg.number);
+        if (idx !== -1) {
+          packages[idx] = enrichedPkg;
+        }
+      }
+
+      enrichedCount += enrichedBatch.length;
+      checkpoint.enrichedCount = enrichedCount;
+      checkpoint.lastProcessedNumber = enrichedBatch[enrichedBatch.length - 1].number;
+
+      // Save checkpoint every 1000 packages
+      if (enrichedCount % 1000 === 0) {
+        saveCheckpoint(checkpoint);
+      }
+
+      // Progress logging
+      if (enrichedCount % 100 === 0 || enrichedCount === totalToEnrich) {
+        const progress = ((enrichedCount / totalToEnrich) * 100).toFixed(1);
+        const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
+        const rate = Math.round(enrichedCount / ((Date.now() - startTime) / 1000 / 60));
+        const remaining = Math.round((totalToEnrich - enrichedCount) / rate);
+
+        logger.log('[ENRICH] %s%% | %d/%d | %s min | %d pkg/min | ETA: %d min',
+          progress, enrichedCount, totalToEnrich, elapsed, rate, remaining);
+      }
+    }
+
+    // Write enriched CSV
+    logger.log('═══════════════════════════════════════════════════════');
+    logger.log('[STEP 3/3] WRITING CSV');
+    logger.log('═══════════════════════════════════════════════════════');
     
-    const totalDuration = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
-    const throughput = Math.round(processed / parseFloat(totalDuration));
+    await writeCSV(packages);
     
-    console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-    console.log('[%s] ✓✓✓ ENRICHMENT COMPLETE ✓✓✓', new Date().toISOString());
-    console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-    console.log('[%s] Duration: %s minutes', new Date().toISOString(), totalDuration);
-    console.log('[%s] Packages enriched: %s', new Date().toISOString(), processed.toLocaleString());
-    console.log('[%s] Throughput: %s packages/minute', new Date().toISOString(), throughput.toLocaleString());
-    console.log('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-    
+    logger.log('[CSV] Written to: %s', CONFIG.outputCsv);
+    logger.log('[CSV] Total rows: %d', packages.length);
+
+    // Final checkpoint
+    checkpoint.endTime = Date.now();
+    checkpoint.duration = ((checkpoint.endTime - startTime) / 1000 / 60).toFixed(2);
+    saveCheckpoint(checkpoint);
+
+    const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
+
+    logger.log('═══════════════════════════════════════════════════════');
+    logger.log('✓✓✓ COMPLETE ✓✓✓');
+    logger.log('═══════════════════════════════════════════════════════');
+    logger.log('Duration: %s minutes', duration);
+    logger.log('Enriched: %d packages', enrichedCount);
+    logger.log('Total: %d packages', packages.length);
+    logger.log('Throughput: %d pkg/min', Math.round(enrichedCount / parseFloat(duration)));
+    logger.log('═══════════════════════════════════════════════════════');
+
     return {
       success: true,
-      packagesEnriched: processed,
-      duration: totalDuration,
-      throughput,
+      enriched: enrichedCount,
+      total: packages.length,
+      duration: parseFloat(duration),
     };
-    
+
   } catch (err) {
-    console.error('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-    console.error('[%s] ✗✗✗ ENRICHMENT FAILED ✗✗✗', new Date().toISOString());
-    console.error('[%s] ═══════════════════════════════════════════════════════', new Date().toISOString());
-    console.error('[%s] Error: %s', new Date().toISOString(), err.message);
-    console.error('[%s] Stack: %s', new Date().toISOString(), err.stack);
+    logger.error('═══════════════════════════════════════════════════════');
+    logger.error('✗✗✗ FAILED ✗✗✗');
+    logger.error('═══════════════════════════════════════════════════════');
+    logger.error('Error: %s', err.message);
+    logger.error('Stack: %s', err.stack);
     throw err;
-  } finally {
-    await client.end();
-    console.log('[%s] [DB] ✓ Connection closed', new Date().toISOString());
   }
 }
 
 // ============================================================================
-// CLI Entry Point
+// Entry Point
 // ============================================================================
 
 if (require.main === module) {
-  enrich()
-    .then(() => process.exit(0))
-    .catch(() => process.exit(1));
+  main()
+    .then(result => {
+      logger.log('[EXIT] Success');
+      process.exit(0);
+    })
+    .catch(err => {
+      logger.error('[EXIT] Failed');
+      process.exit(1);
+    });
 }
 
-module.exports = enrich;
+module.exports = main;
 
