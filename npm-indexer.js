@@ -18,8 +18,15 @@
  * USAGE:
  *   node npm-indexer.js                # Auto-detect and execute (SYNC → PARTIAL ENRICH → SUPPLEMENTARY)
  *   node npm-indexer.js --force        # Force full re-index from scratch
+ *   node npm-indexer.js --reverse      # Index from latest to oldest (most relevant first)
  *   node npm-indexer.js --enrich-only  # Only supplementary enrichment on pending packages
  *   WORKERS=50 node npm-indexer.js     # Adjust parallelism
+ * 
+ * REVERSE MODE BENEFITS:
+ *   - Gets most recently updated/popular packages first
+ *   - Automatic deduplication (keeps latest version)
+ *   - Can stop early and still have useful index
+ *   - Prioritizes actively maintained packages
  * 
  * OUTPUT:
  *   - npm-packages.csv (complete enriched index)
@@ -80,6 +87,7 @@ const CONFIG = {
   // Operation modes
   forceMode: process.argv.includes("--force"),
   enrichOnly: process.argv.includes("--enrich-only"),
+  reverseMode: process.argv.includes("--reverse"), // Index from latest to oldest
   
   // User agent
   userAgent: "npm-indexer-unified/13.0.0",
@@ -857,67 +865,149 @@ class MetadataEnricher {
 // Initial indexing with partial enrichment (include_docs=true)
 async function runInitialIndex(network, enricher, csvWriter, stateMgr) {
   logger.log("═".repeat(60));
-  logger.log("INITIAL INDEX - Fetching with include_docs=true");
+  
+  if (CONFIG.reverseMode) {
+    logger.log("REVERSE INDEX - Latest packages first (deduplication enabled)");
+  } else {
+    logger.log("INITIAL INDEX - Fetching with include_docs=true");
+  }
+  
   logger.log("═".repeat(60));
 
   const registryInfo = await network.getRegistryMetadata();
   const maxSeq = registryInfo.update_seq || 0;
 
   logger.log(`[INDEX] Max sequence: ${maxSeq.toLocaleString()}`);
+  logger.log(`[INDEX] Direction: ${CONFIG.reverseMode ? "REVERSE (max → 0)" : "FORWARD (0 → max)"}`);
 
-  let since = 0;
+  let since = CONFIG.reverseMode ? maxSeq : 0;
   const packagesBuffer = [];
+  const seenPackages = new Set(); // For deduplication in reverse mode
+  let processedBatches = 0;
 
-  while (since < maxSeq) {
-    try {
-      const data = await network.getChanges(since, CONFIG.changesBatchSize, true);
-      const results = data.results || [];
-
-      if (results.length === 0) break;
-
-      for (const change of results) {
-        const id = change.id;
-        if (!id || id.startsWith("_") || id.startsWith("design/")) continue;
-
-        // Partial enrichment from doc
-        const basicMeta = enricher.extractFromDoc(change.doc);
+  // In reverse mode, we fetch forward but process in reverse batch order
+  if (CONFIG.reverseMode) {
+    logger.log("[INDEX] Fetching in chunks, will prioritize latest updates...");
+    
+    // Fetch large chunks and process in reverse
+    const chunkSize = CONFIG.changesBatchSize * 10; // Larger chunks for reverse
+    let currentSeq = maxSeq;
+    
+    while (currentSeq > 0 && processedBatches < 100) { // Limit initial batches in reverse mode
+      const startSeq = Math.max(0, currentSeq - chunkSize);
+      
+      try {
+        const data = await network.getChanges(startSeq, chunkSize, true);
+        const results = data.results || [];
         
-        packagesBuffer.push({
-          name: id,
-          ...basicMeta,
-          enrichmentStatus: "pending",
-          updateType: "new",
-        });
-
-        if (packagesBuffer.length >= 100) {
-          await csvWriter.writePackages(packagesBuffer);
-          logger.log(
-            `[INDEX] +${packagesBuffer.length} packages | ` +
-            `Total: ${GLOBAL_STATE.totalPackages.size.toLocaleString()}`
-          );
-          packagesBuffer.length = 0;
+        if (results.length === 0) break;
+        
+        // Process in reverse order (latest first)
+        for (let i = results.length - 1; i >= 0; i--) {
+          const change = results[i];
+          const id = change.id;
+          
+          if (!id || id.startsWith("_") || id.startsWith("design/")) continue;
+          
+          // Deduplication: skip if already seen
+          if (seenPackages.has(id)) continue;
+          seenPackages.add(id);
+          
+          // Partial enrichment from doc
+          const basicMeta = enricher.extractFromDoc(change.doc);
+          
+          packagesBuffer.push({
+            name: id,
+            ...basicMeta,
+            enrichmentStatus: "pending",
+            updateType: "new",
+          });
+          
+          if (packagesBuffer.length >= 100) {
+            await csvWriter.writePackages(packagesBuffer);
+            logger.log(
+              `[INDEX] +${packagesBuffer.length} packages (unique) | ` +
+              `Total: ${GLOBAL_STATE.totalPackages.size.toLocaleString()} | ` +
+              `Deduped: ${seenPackages.size.toLocaleString()}`
+            );
+            packagesBuffer.length = 0;
+          }
         }
+        
+        currentSeq = startSeq;
+        processedBatches++;
+        
+        // Checkpoint
+        if (GLOBAL_STATE.csvRowNumber - GLOBAL_STATE.lastCheckpointSave >= CONFIG.checkpointInterval) {
+          stateMgr.save({
+            lastSequence: currentSeq,
+            lastIndex: new Date().toISOString(),
+            status: "indexing",
+          });
+        }
+        
+        const progress = (((maxSeq - currentSeq) / maxSeq) * 100).toFixed(1);
+        logger.info(`[INDEX] ${progress}% | seq: ${currentSeq.toLocaleString()} | unique: ${seenPackages.size.toLocaleString()}`);
+        
+      } catch (err) {
+        logger.error(`[INDEX] Error at seq ${currentSeq}: ${err.message}`);
+        break;
       }
+    }
+    
+  } else {
+    // Forward mode (original logic)
+    while (since < maxSeq) {
+      try {
+        const data = await network.getChanges(since, CONFIG.changesBatchSize, true);
+        const results = data.results || [];
 
-      since = data.last_seq || results[results.length - 1].seq;
+        if (results.length === 0) break;
 
-      // Checkpoint
-      if (GLOBAL_STATE.csvRowNumber - GLOBAL_STATE.lastCheckpointSave >= CONFIG.checkpointInterval) {
-        stateMgr.save({
-          lastSequence: since,
-          lastIndex: new Date().toISOString(),
-          status: "indexing",
-        });
+        for (const change of results) {
+          const id = change.id;
+          if (!id || id.startsWith("_") || id.startsWith("design/")) continue;
+
+          // Partial enrichment from doc
+          const basicMeta = enricher.extractFromDoc(change.doc);
+          
+          packagesBuffer.push({
+            name: id,
+            ...basicMeta,
+            enrichmentStatus: "pending",
+            updateType: "new",
+          });
+
+          if (packagesBuffer.length >= 100) {
+            await csvWriter.writePackages(packagesBuffer);
+            logger.log(
+              `[INDEX] +${packagesBuffer.length} packages | ` +
+              `Total: ${GLOBAL_STATE.totalPackages.size.toLocaleString()}`
+            );
+            packagesBuffer.length = 0;
+          }
+        }
+
+        since = data.last_seq || results[results.length - 1].seq;
+
+        // Checkpoint
+        if (GLOBAL_STATE.csvRowNumber - GLOBAL_STATE.lastCheckpointSave >= CONFIG.checkpointInterval) {
+          stateMgr.save({
+            lastSequence: since,
+            lastIndex: new Date().toISOString(),
+            status: "indexing",
+          });
+        }
+
+        const progress = ((since / maxSeq) * 100).toFixed(1);
+        if (since % 100000 === 0) {
+          logger.info(`[INDEX] ${progress}% | seq: ${since.toLocaleString()}`);
+        }
+
+      } catch (err) {
+        logger.error(`[INDEX] Error at seq ${since}: ${err.message}`);
+        break;
       }
-
-      const progress = ((since / maxSeq) * 100).toFixed(1);
-      if (since % 100000 === 0) {
-        logger.info(`[INDEX] ${progress}% | seq: ${since.toLocaleString()}`);
-      }
-
-    } catch (err) {
-      logger.error(`[INDEX] Error at seq ${since}: ${err.message}`);
-      break;
     }
   }
 
