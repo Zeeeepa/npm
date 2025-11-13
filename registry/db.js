@@ -70,7 +70,7 @@ class RegistryDB {
         description TEXT,
         keywords TEXT,
         latest_version TEXT,
-        publish_time TIMESTAMP,
+        publish_time TEXT,
         dependencies_count INTEGER DEFAULT 0,
         file_count INTEGER DEFAULT 0,
         unpacked_size INTEGER DEFAULT 0,
@@ -203,10 +203,23 @@ class RegistryDB {
 
   /**
    * Store enriched metadata for package
-   * @param {number} packageId - Package ID
+   * @param {string|number} packageNameOrId - Package name or ID
    * @param {object} metadata - Metadata object
    */
-  storeMetadata(packageId, metadata) {
+  storeMetadata(packageNameOrId, metadata) {
+    // Support both package name and package ID
+    let packageId;
+    if (typeof packageNameOrId === 'string') {
+      const pkg = this.getPackage(packageNameOrId);
+      if (!pkg) {
+        console.warn(`[DB] Package ${packageNameOrId} not found, skipping metadata`);
+        return null;
+      }
+      packageId = pkg.id;
+    } else {
+      packageId = packageNameOrId;
+    }
+
     const stmt = this.db.prepare(`
       INSERT INTO package_metadata (
         package_id, description, keywords, latest_version,
@@ -234,7 +247,7 @@ class RegistryDB {
       metadata.dependencies_count || 0,
       metadata.file_count || 0,
       metadata.unpacked_size || 0,
-      metadata.npm_url || `https://www.npmjs.com/package/${metadata.name || ''}`
+      metadata.npm_url || `https://www.npmjs.com/package/${typeof packageNameOrId === 'string' ? packageNameOrId : ''}`
     );
   }
 
@@ -398,4 +411,3 @@ class RegistryDB {
 }
 
 export default RegistryDB;
-
