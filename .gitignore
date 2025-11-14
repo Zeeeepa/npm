@@ -33,8 +33,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
-package-lock.json
 
-dist/
-.node
-*.lock
+# Indexer data
+/data/*.db
+/data/*.db-wal
+/data/*.db-shm
+/data/package-index.json
+/data/index-metadata.json
+
